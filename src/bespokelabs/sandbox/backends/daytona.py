@@ -160,16 +160,12 @@ def _create_kwargs(config: SandboxConfig) -> dict:
         timeout = float(raw)
     except (TypeError, ValueError) as exc:
         raise SandboxConfigurationError(
-            f"backend_options['{_CREATE_TIMEOUT_OPTION}'] must be a number of seconds, got {raw!r}",
-            backend="daytona",
-            op="create",
+            f"backend_options['{_CREATE_TIMEOUT_OPTION}'] must be a number of seconds, got {raw!r}"
         ) from exc
     if timeout <= 0:
         raise SandboxConfigurationError(
             f"backend_options['{_CREATE_TIMEOUT_OPTION}'] must be positive; the Daytona SDK treats 0 as "
-            "'no timeout at all', so pass a large finite value instead.",
-            backend="daytona",
-            op="create",
+            "'no timeout at all', so pass a large finite value instead."
         )
     return {"timeout": timeout}
 

@@ -19,3 +19,7 @@ class BackendNotInstalledError(SandboxError):
 
 class FeatureNotSupportedError(SandboxError):
     """The requested feature is not supported by this backend."""
+
+
+class SandboxConfigurationError(SandboxError):
+    """Invalid configuration or arguments (e.g. an unknown backend or a bad manifest entry)."""
