@@ -404,21 +404,74 @@ class StatusTests(GcpBatchTestCase):
 
 class CancelTests(GcpBatchTestCase):
 
-    def test_cancel_deletes_a_running_job(self) -> None:
+    def test_cancel_uses_cancel_job_and_keeps_the_record(self) -> None:
         self.service.get_job.return_value = _job("RUNNING")
         self.service.list_tasks.return_value = iter([_task()])
         status = self.client.cancel_job(JOB)
-        self.assertEqual(status.state, JobState.CANCELLED)
+        self.assertEqual(
+            (status.state, status.reason), (JobState.CANCELLED, "cancelled")
+        )
+        self.service.cancel_job.assert_called_once_with(name=JOB)
+        self.service.delete_job.assert_not_called()
+
+        # The record survives, so a later read says cancelled, not gone.
+        self.service.get_job.return_value = _job("CANCELLATION_IN_PROGRESS")
+        self.service.list_tasks.return_value = iter([_task()])
+        self.assertEqual(self.client.job_status(JOB).state, JobState.RUNNING)
+        self.service.get_job.return_value = _job("CANCELLED")
+        self.service.list_tasks.return_value = iter([_task()])
+        later = self.client.job_status(JOB)
+        self.assertEqual(
+            (later.state, later.reason), (JobState.CANCELLED, "cancelled")
+        )
+        self.assertTrue(later.done)
+
+    def test_cancel_in_progress_is_not_requested_twice(self) -> None:
+        self.service.get_job.return_value = _job("CANCELLATION_IN_PROGRESS")
+        self.service.list_tasks.return_value = iter([_task()])
+        self.assertEqual(self.client.cancel_job(JOB).state, "cancelled")
+        self.service.cancel_job.assert_not_called()
+        self.service.delete_job.assert_not_called()
+
+    def test_falls_back_to_delete_without_cancel_job_in_the_sdk(self) -> None:
+        service = mock.MagicMock(spec=["get_job", "list_tasks", "delete_job"])
+        service.get_job.return_value = _job("QUEUED")
+        self.backend._client = service
+        status = self.client.cancel_job(JOB)
+        self.assertEqual(
+            (status.state, status.reason),
+            (JobState.CANCELLED, "cancelled_by_delete"),
+        )
+        service.delete_job.assert_called_once_with(name=JOB)
+
+    def test_falls_back_to_delete_when_the_service_lacks_cancel(self) -> None:
+        self.service.get_job.return_value = _job("QUEUED")
+        self.service.cancel_job.side_effect = gexc.MethodNotImplemented("501")
+        status = self.client.cancel_job(JOB)
+        self.assertEqual(status.reason, "cancelled_by_delete")
         self.service.delete_job.assert_called_once_with(name=JOB)
+
+    def test_cancel_errors_are_classified_not_swallowed(self) -> None:
+        self.service.get_job.return_value = _job("QUEUED")
+        self.service.cancel_job.side_effect = gexc.PermissionDenied("no")
+        with self.assertRaises(SandboxAuthenticationError):
+            self.client.cancel_job(JOB)
+        self.service.delete_job.assert_not_called()
 
     def test_cancel_leaves_a_finished_job(self) -> None:
         self.service.get_job.return_value = _job("SUCCEEDED")
         self.service.list_tasks.return_value = iter([_task()])
         self.assertEqual(self.client.cancel_job(JOB).state, "succeeded")
+        self.service.cancel_job.assert_not_called()
         self.service.delete_job.assert_not_called()
 
     def test_cancel_a_missing_job(self) -> None:
         self.service.get_job.side_effect = gexc.NotFound("gone")
+        self.assertEqual(self.client.cancel_job(JOB).reason, "job_not_found")
+
+    def test_job_vanishing_during_cancel(self) -> None:
+        self.service.get_job.return_value = _job("QUEUED")
+        self.service.cancel_job.side_effect = gexc.NotFound("gone")
         self.assertEqual(self.client.cancel_job(JOB).reason, "job_not_found")
 
 

@@ -88,7 +88,8 @@ _JOB_ID_RE = re.compile(r"[a-z]([a-z0-9-]{0,61}[a-z0-9])?")
 _LABEL_RE = re.compile(r"[^a-z0-9_-]")
 
 # Batch job states -> JobState.  STATE_UNSPECIFIED is a job Batch has not
-# classified yet, not an unknown outcome, so it reads as pending.
+# classified yet, not an unknown outcome, so it reads as pending.  A job
+# being cancelled still has VMs running, so it is not terminal yet.
 _STATES = {
     "STATE_UNSPECIFIED": JobState.PENDING,
     "QUEUED": JobState.PENDING,
@@ -311,6 +312,13 @@ def _is_not_found(exc: Exception) -> bool:
     return type(exc).__name__ == "NotFound" or getattr(exc, "code", None) == 404
 
 
+def _is_unimplemented(exc: Exception) -> bool:
+    return (
+        type(exc).__name__ in {"MethodNotImplemented", "NotImplemented"}
+        or getattr(exc, "code", None) == 501
+    )
+
+
 def _as_datetime(value: Any) -> datetime.datetime | None:
     """Normalize a proto timestamp (DatetimeWithNanoseconds) to aware UTC."""
     if not isinstance(value, datetime.datetime):
@@ -332,7 +340,7 @@ class GcpBatchClient:
     ``create()`` / ``resume()`` raise FeatureNotSupportedError: Batch runs
     jobs, not interactive sandboxes.  Use ``SandboxClient("gcp_batch")``'s
     ``submit_job`` / ``job_status`` / ``wait_job`` / ``job_logs`` /
-    ``cancel_job``.
+    ``cancel_job`` (Batch CancelJob; delete only as a fallback).
     """
 
     #: Interactive sandboxes are not available on this backend.
@@ -731,29 +739,55 @@ class GcpBatchClient:
         return str(payload or "")
 
     def cancel_job(self, job_id: str) -> JobStatus:
-        """Delete a pending or running job; a finished job is left as is."""
+        """Cancel a pending or running job; a finished job is left as is.
+
+        Uses Batch's CancelJob, which stops the job's VMs and keeps its
+        record, so later status reads ``cancelled``.  The returned operation
+        is not awaited: the job reports CANCELLATION_IN_PROGRESS (``running``)
+        until Batch settles it as CANCELLED.  When the installed SDK or the
+        service lacks CancelJob, the job is deleted instead (also stopping
+        its VMs) and the result says so with ``reason="cancelled_by_delete"``;
+        a deleted job later reads as ``unknown`` / ``job_not_found``.
+        """
         job = self._get(job_id, "cancel_job")
         if job is None:
             return self._gone(job_id)
         status = self._status(job_id, job)
         if status.done:
             return status
-        try:
-            # Deletion stops the job's VMs.  The returned long-running
-            # operation is not awaited: the job reports DELETION_IN_PROGRESS
-            # and then disappears.
-            self._service().delete_job(name=job_id)
-        except Exception as exc:
-            if _is_not_found(exc):
+        reason = "cancelled"
+        if status.details.get("batch_state") != "CANCELLATION_IN_PROGRESS":
+            reason = self._cancel_or_delete(job_id)
+            if reason is None:
                 return self._gone(job_id)
-            raise _classify(exc, "cancel_job") from exc
         return JobStatus(
             job_id=job_id,
             state=JobState.CANCELLED,
             started_at=status.started_at,
-            reason="cancelled",
+            reason=reason,
             details=status.details,
         )
+
+    def _cancel_or_delete(self, job_id: str) -> str | None:
+        """Stop the job; the JobStatus reason, or ``None`` if it is gone."""
+        service = self._service()
+        cancel = getattr(service, "cancel_job", None)
+        if callable(cancel) and hasattr(self._batch, "CancelJobRequest"):
+            try:
+                cancel(name=job_id)
+                return "cancelled"
+            except Exception as exc:
+                if _is_not_found(exc):
+                    return None
+                if not _is_unimplemented(exc):
+                    raise _classify(exc, "cancel_job") from exc
+        try:
+            service.delete_job(name=job_id)
+        except Exception as exc:
+            if _is_not_found(exc):
+                return None
+            raise _classify(exc, "cancel_job") from exc
+        return "cancelled_by_delete"
 
     # -- Configuration ---------------------------------------------------
 

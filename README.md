@@ -1218,8 +1218,11 @@ GPU count that fits `cpu` and `memory_mb` is chosen (H100 counts below 8 need
 the exit code comes from the task, and Batch's reserved exit codes become
 reasons (`50005` is `"timeout"`, `50001` `"vm_preempted"`, ...). Logs are read
 from Cloud Logging (`batch_task_logs`, by job uid) and may lag a few seconds.
-`cancel_job` deletes a pending or running job; a deleted job then reads as
-`unknown` / `"job_not_found"`. `files` / `workspace` and snapshots are not
+`cancel_job` uses Batch's CancelJob on a pending or running job: the record
+stays, the job reads `running` while Batch stops its VMs, then `cancelled`.
+If the installed SDK or the service lacks CancelJob, the job is deleted
+instead (`reason="cancelled_by_delete"`) and later reads as `unknown` /
+`"job_not_found"`. `files` / `workspace` and snapshots are not
 supported. Credentials are Application Default Credentials.
 
 | `backend_options` key | Meaning |
