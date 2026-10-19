@@ -65,9 +65,10 @@ class JobSpecTests(unittest.TestCase):
 
     def test_rejects_non_positive_resources(self) -> None:
         for field in ("cpu", "memory_mb", "timeout_secs", "disk_mb"):
-            with self.subTest(field=field):
-                with self.assertRaises(SandboxConfigurationError):
-                    JobSpec(command="true", **{field: 0})
+            for value in (0, -1, True):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(SandboxConfigurationError):
+                        JobSpec(command="true", **{field: value})
 
     def test_rejects_env_names_the_shell_cannot_export(self) -> None:
         for name in ("1A", "A-B", "A B", ""):
@@ -268,15 +269,22 @@ class _FakeSession:
 
 
 class _FakeBackend:
+    """A provider client.
 
-    def __init__(self) -> None:
+    ``sessions`` is the provider's side: clients built with the same dict see
+    the same sandboxes, the way two processes see one provider account.
+    """
+
+    def __init__(self, sessions: dict[str, _FakeSession] | None = None) -> None:
         self.configs: list[object] = []
-        self.sessions: dict[str, _FakeSession] = {}
+        self.sessions: dict[str, _FakeSession] = (
+            {} if sessions is None else sessions
+        )
         self.resume_error: Exception | None = None
 
     def create(self, config: object) -> _FakeSession:
         self.configs.append(config)
-        session = _FakeSession(f"sb-{len(self.configs)}")
+        session = _FakeSession(f"sb-{len(self.sessions) + 1}")
         self.sessions[session.sandbox_id] = session
         return session
 
@@ -286,8 +294,10 @@ class _FakeBackend:
         return self.sessions[data["sandbox_id"]]
 
 
-def _client(name: str) -> tuple[SandboxClient, _FakeBackend]:
-    backend = _FakeBackend()
+def _client(
+    name: str, sessions: dict[str, _FakeSession] | None = None
+) -> tuple[SandboxClient, _FakeBackend]:
+    backend = _FakeBackend(sessions)
     with mock.patch.dict(
         "bespokelabs.sandbox.backends.BACKENDS",
         {name: mock.Mock(return_value=backend)},
@@ -330,7 +340,9 @@ class GenericRunnerTests(unittest.TestCase):
         launch = next(v for k, v in session.files.items() if "launch.sh" in k)
         self.assertIn("export TOKEN='it'\"'\"'s secret'", launch)
         self.assertIn("cd /work", launch)
-        self.assertIn("timeout 600 python train.py", launch)
+        self.assertIn("$tk 600 python train.py", launch)
+        self.assertIn("timeout -k 30", launch)
+        self.assertIn('kill -KILL "-$2"', launch)
         self.assertIn("nohup", session.commands[-1])
 
         _, payload = _jobs.decode_job_id(job_id)
@@ -338,8 +350,8 @@ class GenericRunnerTests(unittest.TestCase):
         self.assertNotIn("secret", job_id)
 
         # A brand new client (a restarted worker) finds the job by id alone.
-        fresh, _ = _client("docker")
-        fresh._backend_client = backend
+        fresh, fresh_backend = _client("docker", sessions=backend.sessions)
+        self.assertIsNot(fresh_backend, backend)
         status = fresh.job_status(job_id)
         self.assertEqual(status.state, JobState.RUNNING)
         self.assertEqual(status.details["sandbox_id"], "sb-1")
@@ -352,7 +364,7 @@ class GenericRunnerTests(unittest.TestCase):
             for k, v in backend.sessions["sb-1"].files.items()
             if "launch.sh" in k
         )
-        self.assertIn("timeout 3600 sh -c 'echo $HOME | wc -c'", launch)
+        self.assertIn("$tk 3600 sh -c 'echo $HOME | wc -c'", launch)
 
     def test_backend_label_keys_and_daytona_defaults(self) -> None:
         expected = {
@@ -613,6 +625,34 @@ class LocalJobTests(unittest.TestCase):
             b"seeded\n",
         )
 
+    def test_absolute_paths_resolve_under_the_sandbox_root(self) -> None:
+        job_id = self._submit(
+            JobSpec(
+                command="cat /in/seed.txt > /out.txt",
+                files={"/in/seed.txt": "rooted\n"},
+            )
+        )
+        self.assertEqual(_wait(self.client, job_id).state, JobState.SUCCEEDED)
+        sb = self.client.job_sandbox(job_id)
+        self.assertEqual(sb.read_file("/out.txt"), b"rooted\n")
+        argv = self._submit(
+            JobSpec(
+                command=["cat", "/in/seed.txt"], workdir=sb._session._workdir
+            )
+        )
+        self.assertEqual(_wait(self.client, argv).state, JobState.SUCCEEDED)
+        self.assertEqual(self.client.job_logs(argv), "rooted\n")
+
+    def test_timeout_kills_a_command_that_ignores_term(self) -> None:
+        with mock.patch.object(_jobs, "_KILL_GRACE_SECS", 1):
+            job_id = self._submit(
+                JobSpec(command="trap '' TERM; sleep 60", timeout_secs=1)
+            )
+        started = time.monotonic()
+        status = _wait(self.client, job_id)
+        self.assertEqual((status.state, status.reason), ("failed", "timeout"))
+        self.assertLess(time.monotonic() - started, 20)
+
     def test_failure_exit_code(self) -> None:
         job_id = self._submit(JobSpec(command=["sh", "-c", "exit 7"]))
         status = _wait(self.client, job_id)
@@ -665,6 +705,28 @@ class AsyncJobTests(unittest.IsolatedAsyncioTestCase):
             final = await client.cancel_job(job_id)
         self.assertEqual(final.state, JobState.SUCCEEDED)
         self.assertEqual((await client.job_status(job_id)).state, "unknown")
+
+
+class ResumeVerdictTests(unittest.TestCase):
+
+    def test_missing_workdir_is_chained_as_not_found(self) -> None:
+        from bespokelabs.sandbox.backends.local import LocalClient
+
+        with self.assertRaises(SandboxCreationError) as ctx:
+            LocalClient().resume({"workdir": "/nonexistent/bespoke-job-test"})
+        self.assertIsInstance(ctx.exception.__cause__, FileNotFoundError)
+        self.assertTrue(_jobs.is_gone(ctx.exception))
+
+    def test_inaccessible_workdir_is_not_gone(self) -> None:
+        from bespokelabs.sandbox.backends.local import LocalClient
+
+        with (
+            mock.patch("os.path.isdir", return_value=False),
+            mock.patch("os.stat", side_effect=PermissionError("denied")),
+        ):
+            with self.assertRaises(SandboxCreationError) as ctx:
+                LocalClient().resume({"workdir": "/locked"})
+        self.assertFalse(_jobs.is_gone(ctx.exception))
 
 
 class ControlPlaneDefaultsTests(unittest.TestCase):

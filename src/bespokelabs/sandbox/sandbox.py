@@ -831,12 +831,15 @@ class SandboxClient:
         return self._runner_for(job_id).job_logs(job_id, tail)
 
     def cancel_job(self, job_id: str) -> JobStatus:
-        """Stop the job and release its resources; return its final status.
+        """Stop the job and release its resources; return its status after.
 
-        A job still pending or running ends ``cancelled``.  A job that had
-        already finished keeps its state; on sandbox backends its sandbox is
-        destroyed either way.  Cancelling a job that is already gone returns
-        its ``unknown`` status rather than raising.
+        On sandbox backends cancellation is synchronous: a job still pending
+        or running ends ``cancelled``, a finished job keeps its state, and
+        the sandbox is destroyed either way.  ``gcp_batch`` cancels
+        asynchronously: the result is ``running`` with
+        ``reason="cancelling"`` until Batch settles the job as ``cancelled``
+        (``wait_job`` to see it).  Cancelling a job that is already gone
+        returns its ``unknown`` status rather than raising.
         """
         return self._runner_for(job_id).cancel_job(job_id)
 

@@ -10,7 +10,8 @@ Configuration (``JobSpec.backend_options`` wins over the environment):
                    Application Default Credentials project.
   region           Batch location; else ``GOOGLE_CLOUD_REGION``, else
                    ``CLOUDSDK_COMPUTE_REGION``.
-  service_account  Email of the service account the VMs run as.
+  service_account  Email of the service account the VMs run as;
+                   ``service_account_scopes`` (list) sets its OAuth scopes.
   network /        Network and subnetwork URLs or paths for the VMs;
   subnetwork       ``no_external_ip`` (bool) drops their external IP.
   machine_type     Overrides the machine type chosen for ``cpu`` /
@@ -66,6 +67,7 @@ _OPTION_KEYS = frozenset(
         "project",
         "region",
         "service_account",
+        "service_account_scopes",
         "network",
         "subnetwork",
         "no_external_ip",
@@ -89,7 +91,8 @@ _LABEL_RE = re.compile(r"[^a-z0-9_-]")
 
 # Batch job states -> JobState.  STATE_UNSPECIFIED is a job Batch has not
 # classified yet, not an unknown outcome, so it reads as pending.  A job
-# being cancelled still has VMs running, so it is not terminal yet.
+# being cancelled or deleted can still have VMs running, so neither is
+# terminal yet (see _IN_PROGRESS_REASONS).
 _STATES = {
     "STATE_UNSPECIFIED": JobState.PENDING,
     "QUEUED": JobState.PENDING,
@@ -99,7 +102,11 @@ _STATES = {
     "FAILED": JobState.FAILED,
     "CANCELLATION_IN_PROGRESS": JobState.RUNNING,
     "CANCELLED": JobState.CANCELLED,
-    "DELETION_IN_PROGRESS": JobState.CANCELLED,
+    "DELETION_IN_PROGRESS": JobState.RUNNING,
+}
+_IN_PROGRESS_REASONS = {
+    "CANCELLATION_IN_PROGRESS": "cancelling",
+    "DELETION_IN_PROGRESS": "deleting",
 }
 
 # Exit codes Batch reserves for its own failures
@@ -521,7 +528,14 @@ class GcpBatchClient:
             allocation.labels = labels
         if options.get("service_account"):
             allocation.service_account = batch.ServiceAccount(
-                email=str(options["service_account"])
+                email=str(options["service_account"]),
+                scopes=list(options.get("service_account_scopes") or []),
+            )
+        elif options.get("service_account_scopes"):
+            raise SandboxConfigurationError(
+                "service_account_scopes needs service_account",
+                backend="gcp_batch",
+                op="submit_job",
             )
         if options.get("allowed_locations"):
             allocation.location = batch.AllocationPolicy.LocationPolicy(
@@ -639,6 +653,7 @@ class GcpBatchClient:
         events = list(getattr(job.status, "status_events", None) or [])
         if events:
             details["last_event"] = getattr(events[-1], "description", None)
+        task_message = None
         exit_code = None
         started_at = finished_at = None
         if state is not JobState.PENDING:
@@ -649,6 +664,9 @@ class GcpBatchClient:
             ):
                 task_state = _enum_name(getattr(event, "task_state", ""))
                 when = _as_datetime(getattr(event, "event_time", None))
+                task_message = getattr(event, "description", None) or (
+                    task_message
+                )
                 if task_state == "RUNNING" and started_at is None:
                     started_at = when
                 if task_state in {"SUCCEEDED", "FAILED"}:
@@ -659,7 +677,16 @@ class GcpBatchClient:
                     "task_execution" in event
                 ):
                     exit_code = int(event.task_execution.exit_code)
-        reason = None
+        # The provider's own words for what happened last.  A task that ran
+        # explains its own exit; a job that failed with no task exit (image
+        # pull, quota, permissions) is explained by the job's last event.
+        if state is JobState.FAILED and exit_code is None:
+            message = details.get("last_event") or task_message
+        else:
+            message = task_message or details.get("last_event")
+        if message:
+            details["message"] = message
+        reason = _IN_PROGRESS_REASONS.get(batch_state)
         if state is JobState.FAILED:
             reason = (
                 "batch_failed"
@@ -742,40 +769,39 @@ class GcpBatchClient:
         """Cancel a pending or running job; a finished job is left as is.
 
         Uses Batch's CancelJob, which stops the job's VMs and keeps its
-        record, so later status reads ``cancelled``.  The returned operation
-        is not awaited: the job reports CANCELLATION_IN_PROGRESS (``running``)
-        until Batch settles it as CANCELLED.  When the installed SDK or the
-        service lacks CancelJob, the job is deleted instead (also stopping
-        its VMs) and the result says so with ``reason="cancelled_by_delete"``;
-        a deleted job later reads as ``unknown`` / ``job_not_found``.
+        record.  Batch cancels asynchronously, so the returned status is
+        ``running`` with ``reason="cancelling"`` -- consistent with
+        ``job_status`` -- until Batch settles the job as CANCELLED; call
+        ``wait_job`` to see that.  When the installed SDK or the service
+        lacks CancelJob, the job is deleted instead (also stopping its VMs)
+        and the reason is ``"cancelling_by_delete"``; a deleted job then
+        reads as ``unknown`` / ``job_not_found``.
         """
         job = self._get(job_id, "cancel_job")
         if job is None:
             return self._gone(job_id)
         status = self._status(job_id, job)
-        if status.done:
+        if status.done or status.reason in _IN_PROGRESS_REASONS.values():
             return status
-        reason = "cancelled"
-        if status.details.get("batch_state") != "CANCELLATION_IN_PROGRESS":
-            reason = self._cancel_or_delete(job_id)
-            if reason is None:
-                return self._gone(job_id)
+        how = self._cancel_or_delete(job_id)
+        if how is None:
+            return self._gone(job_id)
         return JobStatus(
             job_id=job_id,
-            state=JobState.CANCELLED,
+            state=JobState.RUNNING,
             started_at=status.started_at,
-            reason=reason,
+            reason="cancelling" if how == "cancel" else "cancelling_by_delete",
             details=status.details,
         )
 
     def _cancel_or_delete(self, job_id: str) -> str | None:
-        """Stop the job; the JobStatus reason, or ``None`` if it is gone."""
+        """Stop the job: ``"cancel"``, ``"delete"``, or ``None`` if it is gone."""
         service = self._service()
         cancel = getattr(service, "cancel_job", None)
         if callable(cancel) and hasattr(self._batch, "CancelJobRequest"):
             try:
                 cancel(name=job_id)
-                return "cancelled"
+                return "cancel"
             except Exception as exc:
                 if _is_not_found(exc):
                     return None
@@ -787,7 +813,7 @@ class GcpBatchClient:
             if _is_not_found(exc):
                 return None
             raise _classify(exc, "cancel_job") from exc
-        return "cancelled_by_delete"
+        return "delete"
 
     # -- Configuration ---------------------------------------------------
 

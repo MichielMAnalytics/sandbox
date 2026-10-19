@@ -39,6 +39,10 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from bespokelabs.sandbox.backends._prelude import (
+    SHELL_PRELUDE,
+    rewrite_redirects,
+)
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
     FeatureNotSupportedError,
@@ -104,6 +108,9 @@ _LABEL_OPTIONS = {
 _DEFAULT_OPTIONS: dict[str, dict[str, Any]] = {
     "daytona": {"auto_stop_interval": 0},
 }
+
+# Seconds between a timed-out command's TERM and its KILL.
+_KILL_GRACE_SECS = 30
 
 # Wait-loop tolerance, ported from PDK (pdk/sandbox.py).  Consecutive failed
 # provider reads tolerated before the job has been seen alive, and the
@@ -217,16 +224,43 @@ def _wrap(exc: Exception, backend: str, op: str) -> SandboxError:
 # -- Shell scripts -------------------------------------------------------------
 
 
-def _launcher_script(spec: JobSpec, job_dir: str, workdir: str | None) -> str:
+def _host_rooted_command(command: str | list[str], root: str) -> str:
+    """Give a local/safehouse job the path semantics of ``execute_command``.
+
+    Those backends treat their workdir as the filesystem root: absolute
+    paths in shell commands go through the bash prelude and redirect
+    rewriting, and absolute argv arguments are rebased under the root.
+    """
+    if isinstance(command, list):
+        args = [
+            root + arg if arg.startswith("/") else arg for arg in command[1:]
+        ]
+        return shlex.join([command[0], *args])
+    script = SHELL_PRELUDE + rewrite_redirects(command)
+    return f"bash -c {shlex.quote(script)}"
+
+
+def _launcher_script(
+    spec: JobSpec,
+    job_dir: str,
+    workdir: str | None,
+    host_root: str | None = None,
+) -> str:
     """Build the script that runs the command and records how it ended."""
     q = shlex.quote
-    if isinstance(spec.command, list):
+    if host_root is not None:
+        command = _host_rooted_command(spec.command, host_root)
+    elif isinstance(spec.command, list):
         command = shlex.join(spec.command)
     else:
         command = f"sh -c {q(spec.command)}"
     timeout = int(spec.timeout_secs)
+    grace = _KILL_GRACE_SECS
+    env = dict(spec.env_vars)
+    if host_root is not None:
+        env.setdefault("SANDBOX_ROOT", host_root)
     exports = "".join(
-        f"export {name}={q(value)}\n" for name, value in spec.env_vars.items()
+        f"export {name}={q(value)}\n" for name, value in env.items()
     )
     enter_workdir = ""
     if workdir:
@@ -258,14 +292,20 @@ def _launcher_script(spec: JobSpec, job_dir: str, workdir: str | None) -> str:
         "if command -v setsid >/dev/null 2>&1; then grp=setsid\n"
         "else grp=; set -m 2>/dev/null || :\n"
         "fi\n"
+        "# The deadline sends TERM, then KILL after a grace period, so a\n"
+        "# command that ignores TERM cannot outlive timeout_secs.\n"
         "if command -v timeout >/dev/null 2>&1; then\n"
-        f'  $grp timeout {timeout} {command} >>"$d/log" 2>&1 </dev/null &\n'
+        f"  if timeout -k 1 1 true >/dev/null 2>&1; then tk='timeout -k {grace}'\n"
+        "  else tk=timeout\n"
+        "  fi\n"
+        f'  $grp $tk {timeout} {command} >>"$d/log" 2>&1 </dev/null &\n'
         "  child=$!\n"
         "else\n"
         f'  $grp {command} >>"$d/log" 2>&1 </dev/null &\n'
         "  child=$!\n"
         '  $grp sh -c \'sleep "$1"; kill -TERM "-$2" 2>/dev/null ||'
-        f' kill -TERM "$2"\' watchdog {timeout} "$child"'
+        ' kill -TERM "$2"; sleep "$3"; kill -KILL "-$2" 2>/dev/null ||'
+        f' kill -KILL "$2"\' watchdog {timeout} "$child" {grace}'
         " >/dev/null 2>&1 </dev/null &\n"
         "  watchdog=$!\n"
         '  printf \'%s\\n\' "$watchdog" >"$d/watchdog.pid"\n'
@@ -537,7 +577,12 @@ class SessionJobRunner:
             _run(sb, f"mkdir -p {shlex.quote(job_dir)}")
             sb.write_file(
                 f"{relative_dir}/launch.sh",
-                _launcher_script(spec, job_dir, workdir),
+                _launcher_script(
+                    spec,
+                    job_dir,
+                    workdir,
+                    host_root=root.rstrip("/") if host_rooted else None,
+                ),
             )
             started = _facts(_run(sb, _start_script(job_dir)))
             if _int(started.get("submitted")) is None:

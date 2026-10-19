@@ -87,8 +87,9 @@ class SandboxJobBackend(Protocol):
 
     ``submit_job`` returns a job id that any process can pass to the other
     methods; it must carry everything needed to find the job again.
-    ``cancel_job`` stops the job, releases its resources, and returns its
-    final status.
+    ``cancel_job`` stops the job and returns its status after the request:
+    terminal where cancellation is synchronous, or ``running`` with a
+    ``cancelling`` reason where the provider cancels asynchronously.
     """
 
     def submit_job(self, spec: JobSpec) -> str:

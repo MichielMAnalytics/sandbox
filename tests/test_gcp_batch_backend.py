@@ -44,21 +44,29 @@ def _when(seconds: int) -> datetime.datetime:
     return datetime.datetime(2026, 10, 17, 12, 0, seconds, tzinfo=datetime.UTC)
 
 
-def _job(state: str, *, uid: str = "uid-1") -> object:
+def _job(
+    state: str, *, uid: str = "uid-1", events: tuple[str, ...] = ()
+) -> object:
     return batch_v1.Job(
         name=JOB,
         uid=uid,
-        status=batch_v1.JobStatus(state=batch_v1.JobStatus.State[state]),
+        status=batch_v1.JobStatus(
+            state=batch_v1.JobStatus.State[state],
+            status_events=[
+                batch_v1.StatusEvent(description=text) for text in events
+            ],
+        ),
         task_groups=[batch_v1.TaskGroup(name=f"{JOB}/taskGroups/group0")],
     )
 
 
-def _task(*events: tuple[str, int, int | None]) -> object:
+def _task(*events: tuple) -> object:
     status_events = []
-    for state, second, exit_code in events:
+    for state, second, exit_code, *text in events:
         event = batch_v1.StatusEvent(
             task_state=batch_v1.TaskStatus.State[state],
             event_time=_when(second),
+            description=text[0] if text else "",
         )
         if exit_code is not None:
             event.task_execution = batch_v1.TaskExecution(exit_code=exit_code)
@@ -157,6 +165,95 @@ class BuildJobTests(GcpBatchTestCase):
             job.logs_policy.destination,
             batch_v1.LogsPolicy.Destination.CLOUD_LOGGING,
         )
+
+    def test_pdk_placement_shape(self) -> None:
+        """What a PDK ``provider: gcp_batch`` run config submits."""
+        image = (
+            "us-central1-docker.pkg.dev/proj/pipelines/worker@sha256:"
+            + "a" * 64
+        )
+        job = self.backend.build_job(
+            JobSpec(
+                command=[
+                    "python",
+                    "-m",
+                    "pdk.entrypoint",
+                    "--input",
+                    "gs://bucket/runs/r1/in",
+                    "--output",
+                    "gs://bucket/runs/r1/out",
+                ],
+                image=image,
+                env_vars={"PDK_RUN_ID": "r1", "HORIZON_URL": "https://h"},
+                cpu=8,
+                memory_mb=32768,
+                disk_mb=200 * 1024,
+                gpu="L4",
+                timeout_secs=6 * 3600,
+                labels={"pdk_pipeline": "table-qa", "pdk_run_id": "r1"},
+                backend_options={
+                    "project": "proj",
+                    "region": "us-central1",
+                    "service_account": "pdk-jobs@proj.iam.gserviceaccount.com",
+                    "service_account_scopes": [
+                        "https://www.googleapis.com/auth/cloud-platform"
+                    ],
+                    "network": "projects/proj/global/networks/workers",
+                    "subnetwork": (
+                        "projects/proj/regions/us-central1/subnetworks/workers"
+                    ),
+                    "no_external_ip": True,
+                },
+            )
+        )
+        task = job.task_groups[0].task_spec
+        container = task.runnables[0].container
+        self.assertEqual(container.image_uri, image)
+        self.assertEqual(container.entrypoint, "python")
+        self.assertEqual(container.commands[-1], "gs://bucket/runs/r1/out")
+        self.assertEqual(
+            dict(task.environment.variables),
+            {"PDK_RUN_ID": "r1", "HORIZON_URL": "https://h"},
+        )
+        self.assertEqual(
+            (task.compute_resource.cpu_milli, task.compute_resource.memory_mib),
+            (8000, 32768),
+        )
+        self.assertEqual(task.max_run_duration.total_seconds(), 6 * 3600)
+        self.assertEqual(task.max_retry_count, 0)
+        allocation = job.allocation_policy
+        instance = allocation.instances[0]
+        self.assertTrue(instance.install_gpu_drivers)
+        self.assertEqual(instance.policy.machine_type, "g2-standard-12")
+        self.assertEqual(instance.policy.boot_disk.size_gb, 200)
+        self.assertEqual(
+            allocation.service_account.email,
+            "pdk-jobs@proj.iam.gserviceaccount.com",
+        )
+        self.assertEqual(
+            list(allocation.service_account.scopes),
+            ["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        nic = allocation.network.network_interfaces[0]
+        self.assertEqual(nic.network, "projects/proj/global/networks/workers")
+        self.assertEqual(
+            nic.subnetwork,
+            "projects/proj/regions/us-central1/subnetworks/workers",
+        )
+        self.assertTrue(nic.no_external_ip_address)
+        self.assertEqual(
+            dict(job.labels), {"pdk_pipeline": "table-qa", "pdk_run_id": "r1"}
+        )
+
+    def test_scopes_need_a_service_account(self) -> None:
+        with self.assertRaises(SandboxConfigurationError):
+            self.backend.build_job(
+                JobSpec(
+                    command="x",
+                    image="i",
+                    backend_options={"service_account_scopes": ["s"]},
+                )
+            )
 
     def test_shell_commands_run_under_sh(self) -> None:
         job = self.backend.build_job(
@@ -367,15 +464,53 @@ class StatusTests(GcpBatchTestCase):
                 )
 
     def test_failure_without_an_exit_code(self) -> None:
-        self.service.get_job.return_value = _job("FAILED")
+        cause = (
+            "Job state is set from SCHEDULED to FAILED: the service account "
+            "cannot pull us-central1-docker.pkg.dev/proj/pipelines/worker"
+        )
+        self.service.get_job.return_value = _job("FAILED", events=(cause,))
         self.service.list_tasks.return_value = iter(
-            [_task(("FAILED", 9, None))]
+            [_task(("FAILED", 9, None, "Task state is updated to FAILED"))]
         )
         status = self.client.job_status(JOB)
         self.assertEqual(
             (status.state, status.exit_code, status.reason),
             (JobState.FAILED, None, "batch_failed"),
         )
+        self.assertEqual(status.details["message"], cause)
+
+    def test_failed_task_explains_its_exit(self) -> None:
+        text = "Task state is updated from RUNNING to FAILED with exit code 2."
+        self.service.get_job.return_value = _job(
+            "FAILED", events=("Job failed due to task failure.",)
+        )
+        self.service.list_tasks.return_value = iter(
+            [_task(("RUNNING", 5, None, "started"), ("FAILED", 9, 2, text))]
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual((status.exit_code, status.reason), (2, "exit_code"))
+        self.assertEqual(status.details["message"], text)
+
+    def test_reattach_from_a_new_process(self) -> None:
+        """A restarted worker holds only the job id: no env, no old client."""
+        service = mock.MagicMock()
+        service.get_job.return_value = _job("SUCCEEDED")
+        service.list_tasks.return_value = iter([_task(("SUCCEEDED", 9, 0))])
+        fresh = GcpBatchClient()
+        fresh._client = service
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.dict(
+                "bespokelabs.sandbox.backends.BACKENDS",
+                {"gcp_batch": mock.Mock(return_value=fresh)},
+            ),
+        ):
+            from bespokelabs.sandbox import job_backend
+
+            client = SandboxClient(job_backend(JOB))
+            status = client.job_status(JOB)
+        self.assertEqual((status.state, status.exit_code), ("succeeded", 0))
+        service.get_job.assert_called_once_with(name=JOB)
 
     def test_missing_job_is_unknown(self) -> None:
         self.service.get_job.side_effect = gexc.NotFound("gone")
@@ -408,16 +543,22 @@ class CancelTests(GcpBatchTestCase):
         self.service.get_job.return_value = _job("RUNNING")
         self.service.list_tasks.return_value = iter([_task()])
         status = self.client.cancel_job(JOB)
+        # Batch cancels asynchronously: not terminal yet, and the same answer
+        # job_status gives while the VMs stop.
         self.assertEqual(
-            (status.state, status.reason), (JobState.CANCELLED, "cancelled")
+            (status.state, status.reason), (JobState.RUNNING, "cancelling")
         )
+        self.assertFalse(status.done)
         self.service.cancel_job.assert_called_once_with(name=JOB)
         self.service.delete_job.assert_not_called()
 
-        # The record survives, so a later read says cancelled, not gone.
         self.service.get_job.return_value = _job("CANCELLATION_IN_PROGRESS")
         self.service.list_tasks.return_value = iter([_task()])
-        self.assertEqual(self.client.job_status(JOB).state, JobState.RUNNING)
+        during = self.client.job_status(JOB)
+        self.assertEqual(
+            (during.state, during.reason), (JobState.RUNNING, "cancelling")
+        )
+        # The record survives, so a later read says cancelled, not gone.
         self.service.get_job.return_value = _job("CANCELLED")
         self.service.list_tasks.return_value = iter([_task()])
         later = self.client.job_status(JOB)
@@ -426,10 +567,28 @@ class CancelTests(GcpBatchTestCase):
         )
         self.assertTrue(later.done)
 
+    def test_wait_after_cancel_ends_cancelled(self) -> None:
+        self.service.get_job.side_effect = [
+            _job("CANCELLATION_IN_PROGRESS"),
+            _job("CANCELLED"),
+        ]
+        self.service.list_tasks.side_effect = lambda **_: iter([_task()])
+        with mock.patch("bespokelabs.sandbox._jobs.time.sleep"):
+            status = self.client.wait_job(JOB, timeout_secs=60, poll_secs=1)
+        self.assertEqual(status.state, JobState.CANCELLED)
+
     def test_cancel_in_progress_is_not_requested_twice(self) -> None:
-        self.service.get_job.return_value = _job("CANCELLATION_IN_PROGRESS")
-        self.service.list_tasks.return_value = iter([_task()])
-        self.assertEqual(self.client.cancel_job(JOB).state, "cancelled")
+        for batch_state, reason in (
+            ("CANCELLATION_IN_PROGRESS", "cancelling"),
+            ("DELETION_IN_PROGRESS", "deleting"),
+        ):
+            with self.subTest(state=batch_state):
+                self.service.get_job.return_value = _job(batch_state)
+                self.service.list_tasks.return_value = iter([_task()])
+                status = self.client.cancel_job(JOB)
+                self.assertEqual(
+                    (status.state, status.reason), (JobState.RUNNING, reason)
+                )
         self.service.cancel_job.assert_not_called()
         self.service.delete_job.assert_not_called()
 
@@ -440,7 +599,7 @@ class CancelTests(GcpBatchTestCase):
         status = self.client.cancel_job(JOB)
         self.assertEqual(
             (status.state, status.reason),
-            (JobState.CANCELLED, "cancelled_by_delete"),
+            (JobState.RUNNING, "cancelling_by_delete"),
         )
         service.delete_job.assert_called_once_with(name=JOB)
 
@@ -448,7 +607,7 @@ class CancelTests(GcpBatchTestCase):
         self.service.get_job.return_value = _job("QUEUED")
         self.service.cancel_job.side_effect = gexc.MethodNotImplemented("501")
         status = self.client.cancel_job(JOB)
-        self.assertEqual(status.reason, "cancelled_by_delete")
+        self.assertEqual(status.reason, "cancelling_by_delete")
         self.service.delete_job.assert_called_once_with(name=JOB)
 
     def test_cancel_errors_are_classified_not_swallowed(self) -> None:

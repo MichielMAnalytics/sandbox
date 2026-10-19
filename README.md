@@ -1164,8 +1164,11 @@ client.cancel_job(job_id)                    # stop it / release its sandbox
 on the event loop and accepts a coroutine `on_poll`.
 
 `JobStatus.state` is a `JobState`: `pending`, `running`, `succeeded`,
-`failed`, `cancelled` or `unknown`. `succeeded` and `failed` come from the
-command's own exit code (`reason="timeout"` when `timeout_secs` stopped it).
+`failed`, `cancelled` or `unknown`. `succeeded` and `failed` normally come from the
+command's own exit code (`reason="timeout"` when `timeout_secs` stopped it);
+Cloud Batch can also fail a job whose command never ran, with
+`exit_code=None`, `reason="batch_failed"` and Batch's own explanation in
+`details["message"]`.
 `unknown` is terminal and means the outcome can no longer be established: the
 sandbox or provider job is gone (`reason="sandbox_gone"` / `"job_not_found"`)
 or the process vanished without recording an exit code (`"process_lost"`). It
@@ -1173,18 +1176,18 @@ is never reported as success. `JobStatus.done` is true for every terminal
 state; `started_at` / `finished_at` are UTC datetimes when known, and
 `details` carries provider facts such as the sandbox id or the raw Batch state.
 
-`wait_job` rides out provider hiccups: up to five consecutive failed reads are
-tolerated before the job has been seen, and once it has, failed reads are
-retried with backoff (capped at 60s) until the deadline. Configuration,
+`wait_job` rides out provider hiccups: before the job has been seen, four
+consecutive failed reads are retried and the fifth raises; once it has been
+seen, failed reads are retried with backoff (capped at 60s) until the deadline. Configuration,
 authentication and not-installed errors raise at once.
 
 **How jobs run.** On Daytona, Modal, Tensorlake, E2B, Docker, Local and
 Safehouse, `submit_job` creates a sandbox, seeds `files` / `workspace`, and
 starts the command detached under a small launcher in
 `/tmp/bespokelabs-jobs/<id>/`. The launcher records its pid, sends the
-command's output to one log file, enforces `timeout_secs` (`timeout`, or a
-watchdog when the image lacks it), and atomically writes the exit code when
-the command ends. The job id is `<backend>:<base64 JSON>` holding the
+command's output to one log file, enforces `timeout_secs` (TERM, then KILL 30
+seconds later, via `timeout` or a watchdog when the image lacks it), and
+atomically writes the exit code when the command ends. The job id is `<backend>:<base64 JSON>` holding the
 backend, the sandbox's `session_state()` payload and that directory, so status
 needs nothing but the id and provider credentials. Status is one probe
 command; cancel marks the job cancelled, signals its process group and
@@ -1197,8 +1200,10 @@ and Safehouse nothing else removes it. Daytona job sandboxes disable Daytona's
 idle auto-stop (`auto_stop_interval=0`, overridable through `backend_options`)
 because it stops sandboxes with running processes; the lifetime above is their
 wall-clock TTL. `labels` become Daytona labels, Docker labels, Modal tags or
-E2B metadata; Tensorlake, Local and Safehouse ignore them. Ray and RunPod do
-not run jobs. The image needs a POSIX `sh` (and `bash` on Docker, Modal and
+E2B metadata; Tensorlake, Local and Safehouse ignore them. On Local and
+Safehouse a job command gets the same path rewriting as `execute_command`
+(absolute paths resolve under the sandbox root). Ray and RunPod do not run
+jobs. The image needs a POSIX `sh` (and `bash` on Docker, Modal and
 Tensorlake, which run commands through it).
 
 **Google Cloud Batch.** `SandboxClient("gcp_batch")` runs each job as a Batch
@@ -1214,22 +1219,29 @@ takes `L4`, `T4`, `V100`, `P100`, `P4`, `A100`, `A100-80GB`, `H100`,
 `H200`, `B200` or a Compute Engine type such as `nvidia-l4`, optionally with
 `:<count>`; Batch installs the driver, and the smallest machine type with that
 GPU count that fits `cpu` and `memory_mb` is chosen (H100 counts below 8 need
-`provisioning_model` `SPOT` or `FLEX_START`). Status maps Batch's job state;
+`provisioning_model` `SPOT` or `FLEX_START`). Pin an image by digest (`.../repo/image@sha256:...`) to run exactly what was
+built. Status maps Batch's job state;
 the exit code comes from the task, and Batch's reserved exit codes become
 reasons (`50005` is `"timeout"`, `50001` `"vm_preempted"`, ...). Logs are read
 from Cloud Logging (`batch_task_logs`, by job uid) and may lag a few seconds.
-`cancel_job` uses Batch's CancelJob on a pending or running job: the record
-stays, the job reads `running` while Batch stops its VMs, then `cancelled`.
-If the installed SDK or the service lacks CancelJob, the job is deleted
-instead (`reason="cancelled_by_delete"`) and later reads as `unknown` /
-`"job_not_found"`. `files` / `workspace` and snapshots are not
+`cancel_job` uses Batch's CancelJob on a pending or running job and keeps its
+record. Batch cancels asynchronously, so `cancel_job` (and `job_status`)
+return `running` with `reason="cancelling"` while it stops the VMs, then
+`job_status` reads `cancelled`; `wait_job` after `cancel_job` to confirm. If
+the installed SDK or the service lacks CancelJob, the job is deleted instead
+(`reason="cancelling_by_delete"`) and later reads as `unknown` /
+`"job_not_found"`. Every status carries Batch's latest event text in
+`details["message"]` (for a failure, why it failed: the task's exit, or the
+job-level cause when no task exited). `files` / `workspace` and snapshots are not
 supported. Credentials are Application Default Credentials.
 
 | `backend_options` key | Meaning |
 |---|---|
 | `project`, `region` | Where to submit (else `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_REGION` or `CLOUDSDK_COMPUTE_REGION`) |
-| `service_account` | Service account email the VMs run as |
-| `network`, `subnetwork`, `no_external_ip` | VM networking |
+| `service_account` | Service account email the VMs run as (it needs Artifact Registry read and whatever the job touches, e.g. GCS) |
+| `service_account_scopes` | OAuth scopes for that service account (list) |
+| `network`, `subnetwork` | VPC network and subnetwork for the VMs (`projects/<p>/global/networks/<n>`, `projects/<p>/regions/<r>/subnetworks/<s>`) |
+| `no_external_ip` | `True` gives the VMs no external IP; the subnet then needs Private Google Access (Artifact Registry, GCS) or Cloud NAT |
 | `machine_type` | Overrides the chosen machine type |
 | `provisioning_model` | `STANDARD`, `SPOT`, `PREEMPTIBLE` or `FLEX_START` |
 | `allowed_locations` | e.g. `["zones/us-central1-a"]` |

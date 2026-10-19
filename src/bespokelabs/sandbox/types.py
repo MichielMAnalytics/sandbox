@@ -193,8 +193,11 @@ _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 class JobState(str, Enum):
     """Lifecycle state of a job submitted with ``SandboxClient.submit_job``.
 
-    ``succeeded`` and ``failed`` come from the command's own exit code
-    (``failed`` includes a command stopped by its ``timeout_secs``).
+    ``succeeded`` and ``failed`` normally come from the command's own exit
+    code (``failed`` includes a command stopped by its ``timeout_secs``).
+    A provider can also fail a job the command never ran in (Cloud Batch:
+    ``exit_code=None``, ``reason="batch_failed"``, with the provider's
+    message in ``details["message"]``).
     ``cancelled`` follows ``cancel_job``.  ``unknown`` is terminal and means
     the outcome can no longer be established -- the sandbox or provider job
     is gone, or the process vanished without recording an exit code.  It is
@@ -289,7 +292,9 @@ class JobSpec:
                 raise SandboxConfigurationError(
                     f"JobSpec.{name} must be positive, got {value!r}"
                 )
-        if self.disk_mb is not None and not self.disk_mb > 0:
+        if self.disk_mb is not None and (
+            isinstance(self.disk_mb, bool) or not self.disk_mb > 0
+        ):
             raise SandboxConfigurationError(
                 f"JobSpec.disk_mb must be positive, got {self.disk_mb!r}"
             )
