@@ -760,8 +760,9 @@ class GcpBatchClient:
         ``job_status`` -- until Batch settles the job as CANCELLED; call
         ``wait_job`` to see that.  When the installed SDK or the service
         lacks CancelJob, the job is deleted instead (also stopping its VMs)
-        and the reason is ``"cancelling_by_delete"``; a deleted job then
-        reads as ``unknown`` / ``job_not_found``.
+        and the reason is ``"deleting"`` -- again what ``job_status`` says
+        while Batch deletes it; a deleted job then reads as ``unknown`` /
+        ``job_not_found``.
         """
         job = self._get(job_id, "cancel_job")
         if job is None:
@@ -776,7 +777,12 @@ class GcpBatchClient:
             job_id=job_id,
             state=JobState.RUNNING,
             started_at=status.started_at,
-            reason="cancelling" if how == "cancel" else "cancelling_by_delete",
+            # The reason job_status gives for the state the request starts.
+            reason=_IN_PROGRESS_REASONS[
+                "CANCELLATION_IN_PROGRESS"
+                if how == "cancel"
+                else "DELETION_IN_PROGRESS"
+            ],
             details=status.details,
         )
 

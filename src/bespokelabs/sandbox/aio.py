@@ -423,6 +423,11 @@ class AsyncSandboxClient:
     # -- Internal ----------------------------------------------------------
 
     async def _jobs(self, op: str) -> Any:
+        # Before constructing the client, so a backend without jobs says so
+        # even when its optional SDK is not installed.
+        _jobs.check_supports_jobs(
+            self._backend_name, BACKENDS[self._backend_name], op
+        )
         backend_client = await self._get_backend_client()
         return _jobs.job_runner(self._backend_name, backend_client, op)
 

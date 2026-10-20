@@ -598,16 +598,22 @@ class CancelTests(GcpBatchTestCase):
         self.backend._client = service
         status = self.client.cancel_job(JOB)
         self.assertEqual(
-            (status.state, status.reason),
-            (JobState.RUNNING, "cancelling_by_delete"),
+            (status.state, status.reason), (JobState.RUNNING, "deleting")
         )
         service.delete_job.assert_called_once_with(name=JOB)
+        # The same answer job_status gives while Batch deletes the job.
+        service.get_job.return_value = _job("DELETION_IN_PROGRESS")
+        service.list_tasks.return_value = iter([_task()])
+        during = self.client.job_status(JOB)
+        self.assertEqual(
+            (during.state, during.reason), (status.state, status.reason)
+        )
 
     def test_falls_back_to_delete_when_the_service_lacks_cancel(self) -> None:
         self.service.get_job.return_value = _job("QUEUED")
         self.service.cancel_job.side_effect = gexc.MethodNotImplemented("501")
         status = self.client.cancel_job(JOB)
-        self.assertEqual(status.reason, "cancelling_by_delete")
+        self.assertEqual(status.reason, "deleting")
         self.service.delete_job.assert_called_once_with(name=JOB)
 
     def test_cancel_errors_are_classified_not_swallowed(self) -> None:

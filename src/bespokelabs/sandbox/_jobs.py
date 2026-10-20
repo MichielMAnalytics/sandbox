@@ -46,20 +46,25 @@ _FATAL_ERRORS = (
 )
 
 
-def job_runner(backend_name: str, backend_client: Any, op: str) -> Any:
-    """Return the backend client if it runs jobs natively, else raise.
+def check_supports_jobs(backend_name: str, backend_cls: type, op: str) -> None:
+    """Raise unless *backend_cls* runs jobs natively.
 
-    The job methods are looked up on the client's type, so a mock instance
-    does not qualify by accident.
+    Checked on the class, so it needs no backend SDK installed (and a mock
+    instance does not qualify by accident).
     """
-    if callable(getattr(type(backend_client), "submit_job", None)):
-        return backend_client
-    raise FeatureNotSupportedError(
-        f"The '{backend_name}' backend does not support jobs; "
-        "use SandboxClient('gcp_batch')",
-        backend=backend_name,
-        op=op,
-    )
+    if not callable(getattr(backend_cls, "submit_job", None)):
+        raise FeatureNotSupportedError(
+            f"The '{backend_name}' backend does not support jobs; "
+            "use SandboxClient('gcp_batch')",
+            backend=backend_name,
+            op=op,
+        )
+
+
+def job_runner(backend_name: str, backend_client: Any, op: str) -> Any:
+    """Return the backend client if it runs jobs natively, else raise."""
+    check_supports_jobs(backend_name, type(backend_client), op)
+    return backend_client
 
 
 # -- Wait loop -----------------------------------------------------------------

@@ -18,6 +18,7 @@ from bespokelabs.sandbox import (
     _jobs,
 )
 from bespokelabs.sandbox.exceptions import (
+    BackendNotInstalledError,
     FeatureNotSupportedError,
     SandboxAuthenticationError,
     SandboxConfigurationError,
@@ -111,6 +112,20 @@ class AsyncUnsupportedBackendTests(unittest.IsolatedAsyncioTestCase):
                     await call
                 self.assertIn("does not support jobs", str(ctx.exception))
                 self.assertEqual(ctx.exception.op, op)
+
+    async def test_async_check_needs_no_backend_sdk(self) -> None:
+        """A backend without jobs says so even without its optional SDK."""
+
+        class NotInstalled:
+            def __init__(self) -> None:
+                raise BackendNotInstalledError("pip install the extra")
+
+        with mock.patch.dict(
+            "bespokelabs.sandbox.backends.BACKENDS", {"ray": NotInstalled}
+        ):
+            client = AsyncSandboxClient("ray")
+            with self.assertRaises(FeatureNotSupportedError):
+                await client.submit_job(JobSpec(command="true"))
 
 
 class WaitPolicyTests(unittest.TestCase):

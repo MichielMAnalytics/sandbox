@@ -1202,7 +1202,8 @@ record. Batch cancels asynchronously, so `cancel_job` (and `job_status`)
 return `running` with `reason="cancelling"` while it stops the VMs, then
 `job_status` reads `cancelled`; `wait_job` after `cancel_job` to confirm. If
 the installed SDK or the service lacks CancelJob, the job is deleted instead
-(`reason="cancelling_by_delete"`) and later reads as `unknown` /
+(`reason="deleting"`, again what `job_status` says while Batch deletes it)
+and later reads as `unknown` /
 `"job_not_found"`. When Batch reports an event description, the status
 carries the latest one in `details["message"]` (for a failure, why it failed:
 the task's exit, or the job-level cause when no task exited); the key is
