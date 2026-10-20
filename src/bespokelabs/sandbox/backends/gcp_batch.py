@@ -635,6 +635,9 @@ class GcpBatchClient:
             "backend": "gcp_batch",
             "batch_state": batch_state,
             "uid": getattr(job, "uid", None),
+            # The job's own labels, as Batch stored them, so a caller can check
+            # a job is one it started before it cancels it.
+            "labels": dict(getattr(job, "labels", None) or {}),
         }
         events = list(getattr(job.status, "status_events", None) or [])
         if events:

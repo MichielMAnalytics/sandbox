@@ -1172,7 +1172,9 @@ Cloud Batch can also fail a job whose command never ran, with
 Batch job is gone (`reason="job_not_found"`). It is never reported as success.
 `JobStatus.done` is true for every terminal state; `started_at` /
 `finished_at` are UTC datetimes when known, and `details` carries provider
-facts such as the raw Batch state.
+facts such as the raw Batch state (`details["batch_state"]`) and, on
+`gcp_batch`, the job's labels as Batch stored them (`details["labels"]`), so a
+caller can check a job is one it started before it cancels it.
 
 `wait_job` rides out provider hiccups: before the job has been seen, four
 consecutive failed reads are retried and the fifth raises; once it has been

@@ -45,11 +45,16 @@ def _when(seconds: int) -> datetime.datetime:
 
 
 def _job(
-    state: str, *, uid: str = "uid-1", events: tuple[str, ...] = ()
+    state: str,
+    *,
+    uid: str = "uid-1",
+    events: tuple[str, ...] = (),
+    labels: dict[str, str] | None = None,
 ) -> object:
     return batch_v1.Job(
         name=JOB,
         uid=uid,
+        labels=labels or {},
         status=batch_v1.JobStatus(
             state=batch_v1.JobStatus.State[state],
             status_events=[
@@ -421,6 +426,19 @@ class StatusTests(GcpBatchTestCase):
         self.assertEqual(status.state, JobState.PENDING)
         self.assertEqual(status.details["batch_state"], "QUEUED")
         self.service.list_tasks.assert_not_called()
+
+    def test_details_carry_the_jobs_labels(self) -> None:
+        """README: a caller checks a job's labels before it cancels it."""
+        self.service.get_job.return_value = _job(
+            "QUEUED", labels={"pdk-workflow": "demo", "pdk-env": "testing"}
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual(
+            status.details["labels"],
+            {"pdk-workflow": "demo", "pdk-env": "testing"},
+        )
+        self.service.get_job.return_value = _job("QUEUED")
+        self.assertEqual(self.client.job_status(JOB).details["labels"], {})
 
     def test_message_is_absent_without_event_text(self) -> None:
         """README: details["message"] exists only when Batch gave a text."""
