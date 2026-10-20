@@ -29,10 +29,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from bespokelabs.sandbox import _jobs
 from bespokelabs.sandbox.backends import BACKENDS
-from bespokelabs.sandbox.exceptions import (
-    FeatureNotSupportedError,
-    SandboxConfigurationError,
-)
+from bespokelabs.sandbox.exceptions import SandboxConfigurationError
 from bespokelabs.sandbox.presets import SandboxPreset
 from bespokelabs.sandbox.protocols import SandboxBackendClient
 from bespokelabs.sandbox.sandbox import Sandbox
@@ -311,7 +308,6 @@ class AsyncSandboxClient:
             )
         self._backend_name = backend
         self._backend_client: SandboxBackendClient | None = None
-        self._job_runner: Any = None
         self._init_lock = asyncio.Lock()
 
     @property
@@ -382,12 +378,12 @@ class AsyncSandboxClient:
 
     async def submit_job(self, spec: JobSpec) -> str:
         """Async version of :meth:`SandboxClient.submit_job`."""
-        runner = await self._runner()
+        runner = await self._jobs("submit_job")
         return await asyncio.to_thread(runner.submit_job, spec)
 
     async def job_status(self, job_id: str) -> JobStatus:
         """Async version of :meth:`SandboxClient.job_status`."""
-        runner = await self._runner_for(job_id)
+        runner = await self._jobs("job_status")
         return await asyncio.to_thread(runner.job_status, job_id)
 
     async def wait_job(
@@ -403,7 +399,7 @@ class AsyncSandboxClient:
         Sleeps on the event loop between polls.  ``on_poll`` may be a plain
         function or a coroutine function.
         """
-        runner = await self._runner_for(job_id)
+        runner = await self._jobs("wait_job")
         return await _jobs.wait_async(
             runner.job_status,
             job_id,
@@ -414,49 +410,21 @@ class AsyncSandboxClient:
 
     async def job_logs(self, job_id: str, tail: int | None = None) -> str:
         """Async version of :meth:`SandboxClient.job_logs`."""
+        runner = await self._jobs("job_logs")
         if tail is not None and tail < 0:
             raise SandboxConfigurationError("tail must be >= 0")
-        runner = await self._runner_for(job_id)
         return await asyncio.to_thread(runner.job_logs, job_id, tail)
 
     async def cancel_job(self, job_id: str) -> JobStatus:
         """Async version of :meth:`SandboxClient.cancel_job`."""
-        runner = await self._runner_for(job_id)
+        runner = await self._jobs("cancel_job")
         return await asyncio.to_thread(runner.cancel_job, job_id)
-
-    async def job_sandbox(self, job_id: str) -> AsyncSandbox:
-        """Async version of :meth:`SandboxClient.job_sandbox`."""
-        runner = await self._runner_for(job_id)
-        attach = getattr(runner, "job_sandbox", None)
-        if attach is None:
-            raise FeatureNotSupportedError(
-                f"'{self._backend_name}' jobs do not run in an attachable "
-                "sandbox",
-                backend=self._backend_name,
-                op="job_sandbox",
-            )
-        return AsyncSandbox(await asyncio.to_thread(attach, job_id))
 
     # -- Internal ----------------------------------------------------------
 
-    async def _runner(self) -> Any:
-        if self._job_runner is None:
-            backend_client = await self._get_backend_client()
-            self._job_runner = _jobs.job_runner(
-                self._backend_name, backend_client
-            )
-        return self._job_runner
-
-    async def _runner_for(self, job_id: str) -> Any:
-        owner = _jobs.job_backend(job_id)
-        if owner != self._backend_name:
-            raise SandboxConfigurationError(
-                f"Job id belongs to backend '{owner}', not "
-                f"'{self._backend_name}'",
-                backend=self._backend_name,
-                context={"job_backend": owner},
-            )
-        return await self._runner()
+    async def _jobs(self, op: str) -> Any:
+        backend_client = await self._get_backend_client()
+        return _jobs.job_runner(self._backend_name, backend_client, op)
 
     async def _get_backend_client(self) -> SandboxBackendClient:
         # Double-checked so only the first construction (SDK import,

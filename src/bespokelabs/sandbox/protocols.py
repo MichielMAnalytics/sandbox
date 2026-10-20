@@ -81,9 +81,8 @@ class SandboxBackendClient(Protocol):
 class SandboxJobBackend(Protocol):
     """A backend client that runs detached jobs natively (e.g. ``gcp_batch``).
 
-    Backend clients without these methods get jobs from the generic
-    implementation, which runs the command detached inside a sandbox created
-    through ``create()`` and reattaches through ``resume()``.
+    ``SandboxClient``'s job methods raise ``FeatureNotSupportedError`` on a
+    backend client without these methods.
 
     ``submit_job`` returns a job id that any process can pass to the other
     methods; it must carry everything needed to find the job again.

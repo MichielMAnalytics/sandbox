@@ -423,24 +423,10 @@ class GcpBatchClient:
                 backend="gcp_batch",
                 op="submit_job",
             )
-        if spec.snapshot_id or spec.template:
-            raise FeatureNotSupportedError(
-                "gcp_batch runs container images; snapshot_id and template "
-                "are not supported",
-                backend="gcp_batch",
-                op="submit_job",
-            )
         if not spec.image:
             raise SandboxConfigurationError(
                 "gcp_batch jobs need JobSpec.image (a container image URI, "
                 "e.g. in Artifact Registry)",
-                backend="gcp_batch",
-                op="submit_job",
-            )
-        if spec.files or spec.workspace is not None:
-            raise FeatureNotSupportedError(
-                "gcp_batch cannot seed files before a job starts; bake them "
-                "into the image or read them from Cloud Storage",
                 backend="gcp_batch",
                 op="submit_job",
             )

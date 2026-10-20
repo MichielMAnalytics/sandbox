@@ -288,11 +288,6 @@ class BuildJobTests(GcpBatchTestCase):
     def test_rejections(self) -> None:
         cases = [
             (JobSpec(command="x"), SandboxConfigurationError),
-            (JobSpec(command="x", snapshot_id="s"), FeatureNotSupportedError),
-            (
-                JobSpec(command="x", image="i", files={"a": "b"}),
-                FeatureNotSupportedError,
-            ),
             (
                 JobSpec(command="x", image="i", backend_options={"nope": 1}),
                 SandboxConfigurationError,
@@ -318,8 +313,6 @@ class BuildJobTests(GcpBatchTestCase):
     def test_interactive_sandboxes_are_not_supported(self) -> None:
         with self.assertRaises(FeatureNotSupportedError):
             Sandbox("gcp_batch")
-        with self.assertRaises(FeatureNotSupportedError):
-            self.client.job_sandbox(JOB)
 
 
 class GpuSelectionTests(unittest.TestCase):
@@ -429,6 +422,15 @@ class StatusTests(GcpBatchTestCase):
         self.assertEqual(status.details["batch_state"], "QUEUED")
         self.service.list_tasks.assert_not_called()
 
+    def test_message_is_absent_without_event_text(self) -> None:
+        """README: details["message"] exists only when Batch gave a text."""
+        self.service.get_job.return_value = _job("RUNNING")
+        self.service.list_tasks.return_value = iter(
+            [_task(("RUNNING", 5, None))]
+        )
+        status = self.client.job_status(JOB)
+        self.assertNotIn("message", status.details)
+
     def test_running(self) -> None:
         self.service.get_job.return_value = _job("RUNNING")
         self.service.list_tasks.return_value = iter(
@@ -505,9 +507,7 @@ class StatusTests(GcpBatchTestCase):
                 {"gcp_batch": mock.Mock(return_value=fresh)},
             ),
         ):
-            from bespokelabs.sandbox import job_backend
-
-            client = SandboxClient(job_backend(JOB))
+            client = SandboxClient("gcp_batch")
             status = client.job_status(JOB)
         self.assertEqual((status.state, status.exit_code), ("succeeded", 0))
         service.get_job.assert_called_once_with(name=JOB)

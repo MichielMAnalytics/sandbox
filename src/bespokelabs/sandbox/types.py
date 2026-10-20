@@ -7,12 +7,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import SandboxConfigurationError
-
-if TYPE_CHECKING:
-    from bespokelabs.sandbox.workspace import Manifest
 
 
 @dataclass
@@ -199,9 +196,8 @@ class JobState(str, Enum):
     ``exit_code=None``, ``reason="batch_failed"``, with the provider's
     message in ``details["message"]``).
     ``cancelled`` follows ``cancel_job``.  ``unknown`` is terminal and means
-    the outcome can no longer be established -- the sandbox or provider job
-    is gone, or the process vanished without recording an exit code.  It is
-    never a guess at success; ``JobStatus.reason`` says which case it is.
+    the outcome can no longer be established (the provider job is gone).  It
+    is never a guess at success; ``JobStatus.reason`` says why.
     """
 
     PENDING = "pending"
@@ -226,31 +222,23 @@ TERMINAL_JOB_STATES = frozenset(
 class JobSpec:
     """A command to run to completion, detached from the submitting process.
 
-    Field names and meanings match :class:`SandboxConfig` and
-    ``Sandbox(...)``; the backend notes there apply here too.  Differences:
+    Resource fields mean what they mean on :class:`SandboxConfig`.  Jobs
+    run on ``gcp_batch`` only; the README maps each field onto Cloud Batch.
 
       - command: an argv list (run without a shell) or a shell string (run
         with ``sh -c``).
+      - image: the container image the job runs in.
       - env_vars: literal values exported for the command only.  Names must
         be valid shell identifiers.
-      - timeout_secs: the command's own run-time limit.  On sandbox
-        backends the sandbox lives an extra hour so outputs stay readable.
-      - labels: provider labels/tags where the backend has them (Daytona
-        labels, Docker labels, Modal tags, E2B metadata, Cloud Batch job and
-        VM labels); ignored elsewhere.
-      - workdir: the command's working directory (created if missing).  On
-        the local backend it is the sandbox root, as for ``Sandbox``.
-      - files / workspace: seeded into the sandbox before the command
-        starts, exactly like ``Sandbox(files=..., workspace=...)``.
-        Unsupported on ``gcp_batch``.
-      - backend_options: merged into the provider create call on sandbox
-        backends; see the README for the ``gcp_batch`` keys.
+      - timeout_secs: the command's own run-time limit.
+      - labels: provider labels (Cloud Batch job and VM labels).
+      - workdir: the command's working directory.
+      - backend_options: provider settings; see the README for the
+        ``gcp_batch`` keys.
     """
 
     command: str | list[str]
     image: str | None = None
-    snapshot_id: str | None = None
-    template: str | None = None
     env_vars: dict[str, str] = field(default_factory=dict)
     cpu: float = 1.0
     memory_mb: int = 1024
@@ -260,9 +248,6 @@ class JobSpec:
     allow_internet: bool = True
     labels: dict[str, str] = field(default_factory=dict)
     workdir: str | None = None
-    app_name: str | None = None
-    files: dict[str, bytes | str] | None = None
-    workspace: Manifest | None = None
     backend_options: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -281,10 +266,6 @@ class JobSpec:
         else:
             raise SandboxConfigurationError(
                 "JobSpec.command must be a shell string or a list of strings"
-            )
-        if self.image and self.snapshot_id:
-            raise SandboxConfigurationError(
-                "JobSpec takes an image or a snapshot_id, not both"
             )
         for name in ("cpu", "memory_mb", "timeout_secs"):
             value = getattr(self, name)
@@ -322,9 +303,9 @@ class JobStatus:
     ``exit_code`` is the command's exit code once it is known.
     ``started_at`` / ``finished_at`` are timezone-aware UTC times when the
     provider reports them.  ``reason`` is a short machine-readable cause for
-    non-success terminal states (e.g. ``"timeout"``, ``"sandbox_gone"``,
-    ``"process_lost"``, ``"job_not_found"``).  ``details`` carries
-    provider-specific facts such as the sandbox id or the raw provider state.
+    non-success terminal states (e.g. ``"timeout"``, ``"job_not_found"``).
+    ``details`` carries provider-specific facts such as the raw provider
+    state.
     """
 
     job_id: str

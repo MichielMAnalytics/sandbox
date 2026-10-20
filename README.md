@@ -1119,36 +1119,37 @@ destroying either affects the other.
 | Local, Safehouse | host workdir | `workdir`, env overlay |
 | Ray | — (not supported) | raises `FeatureNotSupportedError` |
 
-### Detached jobs
+### Detached jobs (Google Cloud Batch)
 
 A job runs one command to completion without the submitting process staying
-attached, like an AWS Batch job. Submit returns a job id at once; the job keeps
-running if your process exits, and any process holding the id can check on it,
-wait for it, read its logs, or cancel it. This is the reattach path for a
-worker that restarts mid-job.
+attached, like an AWS Batch job. Jobs run on the `gcp_batch` backend, as
+Google Cloud Batch jobs on GCP VMs; every other backend raises
+`FeatureNotSupportedError` ("does not support jobs") from the job methods.
+Submit returns a job id at once; the job keeps running if your process exits,
+and any process holding the id can check on it, wait for it, read its logs,
+or cancel it. This is the reattach path for a worker that restarts mid-job.
 
 ```python
-from bespokelabs.sandbox import JobSpec, SandboxClient, job_backend
+from bespokelabs.sandbox import JobSpec, SandboxClient
 
-client = SandboxClient("daytona")
+client = SandboxClient("gcp_batch")
 job_id = client.submit_job(JobSpec(
     command=["python", "train.py", "--epochs", "3"],   # argv, or a shell string
-    image="python:3.12-slim",
+    image="us-docker.pkg.dev/my-project/repo/trainer@sha256:...",
     env_vars={"WANDB_API_KEY": key},                   # exported for the command
     cpu=4, memory_mb=8192, timeout_secs=2 * 3600,
     labels={"team": "evals"},
-    files={"/work/train.py": source},                   # seeded before the start
-    workdir="/work",
+    backend_options={"project": "my-project", "region": "us-central1"},
 ))
 # ... store job_id (a plain string) anywhere ...
 
 # Later, possibly in a new process:
-client = SandboxClient(job_backend(job_id))
+client = SandboxClient("gcp_batch")
 status = client.wait_job(job_id, timeout_secs=3 * 3600, poll_secs=30,
                          on_poll=lambda s: activity.heartbeat(s.state.value))
 print(status.state, status.exit_code, status.reason)
 print(client.job_logs(job_id, tail=100))     # combined stdout + stderr
-client.cancel_job(job_id)                    # stop it / release its sandbox
+client.cancel_job(job_id)                    # stop it
 ```
 
 | Method | Returns |
@@ -1157,8 +1158,7 @@ client.cancel_job(job_id)                    # stop it / release its sandbox
 | `job_status(job_id)` | `JobStatus` |
 | `wait_job(job_id, timeout_secs=None, poll_secs=10.0, *, on_poll=None)` | terminal `JobStatus`; `SandboxTimeoutError` if `timeout_secs` passes first |
 | `job_logs(job_id, tail=None)` | combined stdout/stderr (`str`), or its last `tail` lines |
-| `cancel_job(job_id)` | final `JobStatus` |
-| `job_sandbox(job_id)` | the job's live `Sandbox`, e.g. to download outputs (sandbox backends only) |
+| `cancel_job(job_id)` | `JobStatus` after the cancel request |
 
 `AsyncSandboxClient` has the same methods as coroutines; its `wait_job` sleeps
 on the event loop and accepts a coroutine `on_poll`.
@@ -1167,46 +1167,19 @@ on the event loop and accepts a coroutine `on_poll`.
 `failed`, `cancelled` or `unknown`. `succeeded` and `failed` normally come from the
 command's own exit code (`reason="timeout"` when `timeout_secs` stopped it);
 Cloud Batch can also fail a job whose command never ran, with
-`exit_code=None`, `reason="batch_failed"` and Batch's own explanation in
-`details["message"]`.
+`exit_code=None` and `reason="batch_failed"`.
 `unknown` is terminal and means the outcome can no longer be established: the
-sandbox or provider job is gone (`reason="sandbox_gone"` / `"job_not_found"`)
-or the process vanished without recording an exit code (`"process_lost"`). It
-is never reported as success. `JobStatus.done` is true for every terminal
-state; `started_at` / `finished_at` are UTC datetimes when known, and
-`details` carries provider facts such as the sandbox id or the raw Batch state.
+Batch job is gone (`reason="job_not_found"`). It is never reported as success.
+`JobStatus.done` is true for every terminal state; `started_at` /
+`finished_at` are UTC datetimes when known, and `details` carries provider
+facts such as the raw Batch state.
 
 `wait_job` rides out provider hiccups: before the job has been seen, four
 consecutive failed reads are retried and the fifth raises; once it has been
 seen, failed reads are retried with backoff (capped at 60s) until the deadline. Configuration,
 authentication and not-installed errors raise at once.
 
-**How jobs run.** On Daytona, Modal, Tensorlake, E2B, Docker, Local and
-Safehouse, `submit_job` creates a sandbox, seeds `files` / `workspace`, and
-starts the command detached under a small launcher in
-`/tmp/bespokelabs-jobs/<id>/`. The launcher records its pid, sends the
-command's output to one log file, enforces `timeout_secs` (TERM, then KILL 30
-seconds later, via `timeout` or a watchdog when the image lacks it), and
-atomically writes the exit code when the command ends. The job id is `<backend>:<base64 JSON>` holding the
-backend, the sandbox's `session_state()` payload and that directory, so status
-needs nothing but the id and provider credentials. Status is one probe
-command; cancel marks the job cancelled, signals its process group and
-destroys the sandbox.
-
-The sandbox lives `timeout_secs` plus one hour so logs and files stay readable
-after the command ends (Modal caps the total at 24 hours). Call `cancel_job`
-when you are done with a finished job to release it sooner; on Docker, Local
-and Safehouse nothing else removes it. Daytona job sandboxes disable Daytona's
-idle auto-stop (`auto_stop_interval=0`, overridable through `backend_options`)
-because it stops sandboxes with running processes; the lifetime above is their
-wall-clock TTL. `labels` become Daytona labels, Docker labels, Modal tags or
-E2B metadata; Tensorlake, Local and Safehouse ignore them. On Local and
-Safehouse a job command gets the same path rewriting as `execute_command`
-(absolute paths resolve under the sandbox root). Ray and RunPod do not run
-jobs. The image needs a POSIX `sh` (and `bash` on Docker, Modal and
-Tensorlake, which run commands through it).
-
-**Google Cloud Batch.** `SandboxClient("gcp_batch")` runs each job as a Batch
+**How a Batch job runs.** `SandboxClient("gcp_batch")` runs each job as a Batch
 job with one container task; interactive `Sandbox("gcp_batch")` raises
 `FeatureNotSupportedError`. The job id is the job's resource name,
 `projects/<project>/locations/<region>/jobs/<id>`. `image` is any container
@@ -1230,10 +1203,11 @@ return `running` with `reason="cancelling"` while it stops the VMs, then
 `job_status` reads `cancelled`; `wait_job` after `cancel_job` to confirm. If
 the installed SDK or the service lacks CancelJob, the job is deleted instead
 (`reason="cancelling_by_delete"`) and later reads as `unknown` /
-`"job_not_found"`. Every status carries Batch's latest event text in
-`details["message"]` (for a failure, why it failed: the task's exit, or the
-job-level cause when no task exited). `files` / `workspace` and snapshots are not
-supported. Credentials are Application Default Credentials.
+`"job_not_found"`. When Batch reports an event description, the status
+carries the latest one in `details["message"]` (for a failure, why it failed:
+the task's exit, or the job-level cause when no task exited); the key is
+absent when Batch has given none, so read it with `details.get("message")`. Files reach the job through the
+image or Cloud Storage. Credentials are Application Default Credentials.
 
 | `backend_options` key | Meaning |
 |---|---|
@@ -1374,7 +1348,6 @@ accepts `-c`; use shell commands for other language runtimes.
 | Isolation | Process-level | macOS `sandbox-exec` | Container | Process | Full VM | Container | Container | Container | Full VM |
 | `gpu=` reservation | No | No | No | No | No | No | Yes | Yes | No |
 | Needs install | Nothing | `safehouse` CLI | Docker daemon | `ray` | API key | `tl login` | API key | API key + OpenSSH | API key |
-| Detached jobs (`submit_job`) | Yes | Yes | Yes | No | Yes | Yes | Yes | No | Yes |
 
 Daytona applies CPU/RAM/disk overrides when creating from `image`; the snapshot
 creation path uses the snapshot's resources. RunPod CPU/RAM values are minimums
@@ -1510,7 +1483,7 @@ The test suite exercises Python/API behavior and dashboard asset contracts;
 | `src/bespokelabs/sandbox/sandbox.py` | Direct SDK, lifecycle, workspace setup, structured output, agent cost tracking |
 | `src/bespokelabs/sandbox/aio.py` | Thread-backed async client and session wrapper |
 | `src/bespokelabs/sandbox/backends/` | Lazy-loaded provider clients and sessions, plus the job-only Google Cloud Batch client |
-| `src/bespokelabs/sandbox/_jobs.py` | Detached jobs on sandbox backends, job ids, and the shared wait loop |
+| `src/bespokelabs/sandbox/_jobs.py` | Job backend lookup and the shared `wait_job` loop |
 | `src/bespokelabs/sandbox/protocols.py`, `types.py`, `exceptions.py` | Backend contracts and shared public types/errors |
 | `src/bespokelabs/sandbox/workspace.py`, `_transfer.py` | Manifest entries and directory transfer strategies |
 | `src/bespokelabs/sandbox/agents.py`, `_agent_runtime.py`, `_usage.py` | Agent placement, command preparation, Claude/OpenCode usage parsing |

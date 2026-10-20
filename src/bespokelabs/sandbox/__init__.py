@@ -2,8 +2,7 @@
 
 Unified Python API for cloud sandbox providers.
 Supports Local, Safehouse, Docker, Ray, Daytona, Tensorlake, Modal, RunPod,
-and E2B as interchangeable backends, plus detached jobs on those backends and
-on Google Cloud Batch.
+and E2B as interchangeable backends, plus detached jobs on Google Cloud Batch.
 
 Usage:
     from bespokelabs.sandbox import Sandbox
@@ -13,7 +12,6 @@ Usage:
         print(result.stdout)
 """
 
-from bespokelabs.sandbox._jobs import job_backend
 from bespokelabs.sandbox._transfer import build_files_map
 from bespokelabs.sandbox.agents import (
     AgentCapability,
@@ -99,7 +97,6 @@ __all__ = [
     "JobSpec",
     "JobState",
     "JobStatus",
-    "job_backend",
     "build_files_map",
     "Manifest",
     "WorkspaceEntry",

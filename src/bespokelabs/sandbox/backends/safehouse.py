@@ -73,18 +73,9 @@ class SafehouseClient:
     def resume(self, data: dict) -> SafehouseSession:
         workdir = data.get("workdir")
         if not workdir or not os.path.isdir(workdir):
-            # Chained only when the workdir is truly absent, so callers can
-            # tell "gone" from an existing directory they cannot access.
-            cause = None
-            try:
-                os.stat(workdir or "")
-            except FileNotFoundError:
-                cause = FileNotFoundError(workdir)
-            except OSError:
-                pass
             raise SandboxCreationError(
                 f"Cannot resume safehouse sandbox: workdir '{workdir}' does not exist"
-            ) from cause
+            )
         return SafehouseSession(
             safehouse_bin=self._safehouse_bin,
             workdir=workdir,
