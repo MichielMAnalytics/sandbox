@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import os
@@ -27,6 +28,7 @@ from bespokelabs.sandbox.exceptions import (
 from bespokelabs.sandbox.types import (
     ExposedPort,
     FileInfo,
+    NetworkPolicy,
     SandboxConfig,
     SandboxResult,
     SnapshotInfo,
@@ -135,6 +137,10 @@ class DaytonaClient:
     """
 
     supports_dockerfile = True
+    network_modes = frozenset({"public", "none", "allowlist"})
+    network_option_keys = frozenset(
+        {"network_block_all", "network_allow_list", "domain_allow_list"}
+    )
 
     def __init__(self) -> None:
         try:
@@ -200,6 +206,8 @@ class DaytonaClient:
         create_token = uuid.uuid4().hex
         create_kwargs = _create_kwargs(config)
         _check_dockerfile_context(config)
+        # Validate here so a bad policy is a config error, not a create error.
+        _network_params(config.network)
 
         try:
             params = _build_params(config, create_token=create_token)
@@ -337,6 +345,38 @@ def _image_source(config: SandboxConfig) -> object | None:
     return config.image
 
 
+def _network_params(
+    policy: NetworkPolicy | None, *, update: bool = False
+) -> dict:
+    """Map a policy onto Daytona's network fields.
+
+    Daytona allow-lists take either domains or IPv4 CIDRs, not both.  A CIDR
+    to a preview host opens every preview host, since they share proxy IPs;
+    a domain allow-list filters on SNI and isolates correctly.
+    """
+    if policy is None or policy.mode == "public":
+        # On update, False also clears a stored allow-list.
+        return {"network_block_all": False} if update else {}
+    if policy.mode == "none":
+        return {"network_block_all": True}
+    if policy.domains and policy.cidrs:
+        raise SandboxConfigurationError(
+            "Daytona cannot combine domain and CIDR allow-lists; use one",
+            backend="daytona",
+            op="set_network" if update else "create",
+        )
+    if policy.cidrs:
+        for cidr in policy.cidrs:
+            if ipaddress.ip_network(cidr, strict=False).version != 4:
+                raise SandboxConfigurationError(
+                    f"Daytona CIDR allow-lists take IPv4 only, got {cidr!r}",
+                    backend="daytona",
+                    op="set_network" if update else "create",
+                )
+        return {"network_allow_list": ",".join(policy.cidrs)}
+    return {"domain_allow_list": ",".join(policy.domains)}
+
+
 def _build_params(config: SandboxConfig, *, create_token: str) -> object:
     """Build the appropriate Daytona params object for the config.
 
@@ -361,6 +401,7 @@ def _build_params(config: SandboxConfig, *, create_token: str) -> object:
     common: dict = {}
     if config.env_vars:
         common["env_vars"] = config.env_vars
+    common.update(_network_params(config.network))
 
     # timeout_secs is documented as the sandbox's max lifetime, and ttl_minutes
     # is the only absolute bound Daytona offers, so that is what it maps to.
@@ -549,6 +590,13 @@ class DaytonaSession:
         token = getattr(link, "token", None)
         headers = {"X-Daytona-Preview-Token": token} if token else {}
         return ExposedPort(port=port, url=link.url, headers=headers)
+
+    def set_network(self, policy: NetworkPolicy) -> None:
+        params = _network_params(policy, update=True)
+        try:
+            self._sandbox.update_network_settings(**params)
+        except Exception as exc:
+            raise _classify_daytona_error(exc, op="set_network") from exc
 
     def snapshot(self) -> SnapshotInfo:
         raise FeatureNotSupportedError(

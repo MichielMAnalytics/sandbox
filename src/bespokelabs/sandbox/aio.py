@@ -35,6 +35,7 @@ from bespokelabs.sandbox.types import (
     AgentRunResult,
     ExposedPort,
     FileInfo,
+    NetworkPolicy,
     SandboxResult,
     SandboxSessionState,
     SnapshotInfo,
@@ -79,6 +80,7 @@ class AsyncSandbox:
         context_dir: str | Path | None = None,
         env_vars: dict[str, str] | None = None,
         allow_internet: bool | None = None,
+        network: NetworkPolicy | None = None,
         app_name: str | None = None,
         template: str | None = None,
         snapshot_id: str | None = None,
@@ -102,6 +104,7 @@ class AsyncSandbox:
             context_dir=context_dir,
             env_vars=env_vars,
             allow_internet=allow_internet,
+            network=network,
             app_name=app_name,
             template=template,
             snapshot_id=snapshot_id,
@@ -249,6 +252,10 @@ class AsyncSandbox:
         """Async version of :meth:`Sandbox.expose_port`."""
         return await asyncio.to_thread(self._sandbox.expose_port, port)
 
+    async def set_network(self, policy: NetworkPolicy) -> None:
+        """Async version of :meth:`Sandbox.set_network`."""
+        await asyncio.to_thread(self._sandbox.set_network, policy)
+
     async def snapshot(self) -> SnapshotInfo:
         """Async version of :meth:`Sandbox.snapshot`."""
         return await asyncio.to_thread(self._sandbox.snapshot)
@@ -333,6 +340,7 @@ class AsyncSandboxClient:
         context_dir: str | Path | None = None,
         env_vars: dict[str, str] | None = None,
         allow_internet: bool | None = None,
+        network: NetworkPolicy | None = None,
         app_name: str | None = None,
         template: str | None = None,
         snapshot_id: str | None = None,
@@ -362,6 +370,7 @@ class AsyncSandboxClient:
             context_dir=context_dir,
             env_vars=env_vars,
             allow_internet=allow_internet,
+            network=network,
             app_name=app_name,
             template=template,
             snapshot_id=snapshot_id,

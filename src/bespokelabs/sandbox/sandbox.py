@@ -48,6 +48,7 @@ from bespokelabs.sandbox.types import (
     AgentRunResult,
     ExposedPort,
     FileInfo,
+    NetworkPolicy,
     SandboxConfig,
     SandboxResult,
     SandboxSessionState,
@@ -101,6 +102,7 @@ class Sandbox:
         context_dir: str | Path | None = None,
         env_vars: dict[str, str] | None = None,
         allow_internet: bool | None = None,
+        network: NetworkPolicy | None = None,
         app_name: str | None = None,
         template: str | None = None,
         snapshot_id: str | None = None,
@@ -120,6 +122,16 @@ class Sandbox:
                 f"Unknown backend '{backend}'. Choose from: {', '.join(BACKENDS)}",
                 context={"backend": backend},
             )
+
+        _check_network_args(
+            backend,
+            network,
+            allow_internet,
+            backend_options,
+            _backend_client
+            if _backend_client is not None
+            else BACKENDS[backend],
+        )
 
         dockerfile_path, context_path = _resolve_dockerfile(
             backend,
@@ -174,9 +186,10 @@ class Sandbox:
             dockerfile=dockerfile_path,
             context_dir=context_path,
             env_vars={**defaults.env_vars, **(env_vars or {})},
-            allow_internet=allow_internet
-            if allow_internet is not None
-            else defaults.allow_internet,
+            allow_internet=_allow_internet(
+                network, allow_internet, defaults.allow_internet
+            ),
+            network=network,
             app_name=app_name,
             template=template,
             snapshot_id=snapshot_id,
@@ -444,6 +457,32 @@ class Sandbox:
                 op="expose_port",
             )
         return expose(port)
+
+    # -- Network -----------------------------------------------------------
+
+    def set_network(self, policy: NetworkPolicy) -> None:
+        """Replace the outbound network policy of the running sandbox.
+
+        Raises FeatureNotSupportedError when the backend cannot change the
+        policy after creation or cannot enforce this one.
+        """
+        self._check_alive()
+        if not isinstance(policy, NetworkPolicy):
+            raise SandboxConfigurationError(
+                "set_network() takes a NetworkPolicy",
+                backend=self._config.backend,
+                op="set_network",
+            )
+        setter = getattr(self._session, "set_network", None)
+        if setter is None:
+            raise FeatureNotSupportedError(
+                f"Backend '{self._config.backend}' cannot change the network "
+                "policy of a running sandbox",
+                backend=self._config.backend,
+                op="set_network",
+            )
+        setter(policy)
+        self._config.network = policy
 
     # -- Lifecycle ---------------------------------------------------------
 
@@ -786,6 +825,7 @@ class SandboxClient:
         context_dir: str | Path | None = None,
         env_vars: dict[str, str] | None = None,
         allow_internet: bool | None = None,
+        network: NetworkPolicy | None = None,
         app_name: str | None = None,
         template: str | None = None,
         snapshot_id: str | None = None,
@@ -813,6 +853,7 @@ class SandboxClient:
             context_dir=context_dir,
             env_vars=env_vars,
             allow_internet=allow_internet,
+            network=network,
             app_name=app_name,
             template=template,
             snapshot_id=snapshot_id,
@@ -882,6 +923,65 @@ def _resolve_dockerfile(
             op="create",
         )
     return str(dockerfile_path), str(context_path)
+
+
+def _check_network_args(
+    backend: str,
+    network: NetworkPolicy | None,
+    allow_internet: bool | None,
+    backend_options: dict | None,
+    capabilities: object,
+) -> None:
+    """Validate ``network`` against the backend's class-level capabilities.
+
+    Runs before the adapter is built, so the answer does not depend on
+    whether the backend's SDK is installed.
+    """
+    if network is None:
+        return
+    if not isinstance(network, NetworkPolicy):
+        raise SandboxConfigurationError(
+            "network must be a NetworkPolicy",
+            backend=backend,
+            op="create",
+        )
+    if allow_internet is not None:
+        raise SandboxConfigurationError(
+            "Pass either network or allow_internet, not both",
+            backend=backend,
+            op="create",
+        )
+    if network.mode != "public" and network.mode not in getattr(
+        capabilities, "network_modes", ()
+    ):
+        raise FeatureNotSupportedError(
+            f"Backend '{backend}' cannot enforce network mode '{network.mode}'",
+            backend=backend,
+            op="create",
+        )
+    # backend_options merge last, so these keys would override the policy.
+    clashes = sorted(
+        set(backend_options or ())
+        & set(getattr(capabilities, "network_option_keys", ()))
+    )
+    if clashes:
+        raise SandboxConfigurationError(
+            f"backend_options {clashes} control networking and would "
+            "override network=; set the policy through network= only",
+            backend=backend,
+            op="create",
+        )
+
+
+def _allow_internet(
+    network: NetworkPolicy | None,
+    allow_internet: bool | None,
+    default: bool,
+) -> bool:
+    """Derive the legacy flag, so adapters that only read it still block."""
+    if network is not None:
+        return network.mode != "none"
+    return allow_internet if allow_internet is not None else default
 
 
 # -- Structured output parsing ------------------------------------------------

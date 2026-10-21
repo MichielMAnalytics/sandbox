@@ -15,6 +15,7 @@ from bespokelabs.sandbox.exceptions import (
 from bespokelabs.sandbox.types import (
     ExposedPort,
     FileInfo,
+    NetworkPolicy,
     SandboxConfig,
     SandboxResult,
     SnapshotInfo,
@@ -25,6 +26,16 @@ class ModalClient:
     """Factory for Modal sandboxes."""
 
     supports_dockerfile = True
+    network_modes = frozenset({"public", "none", "allowlist"})
+    # cidr_allowlist is the deprecated name of outbound_cidr_allowlist.
+    network_option_keys = frozenset(
+        {
+            "block_network",
+            "outbound_cidr_allowlist",
+            "outbound_domain_allowlist",
+            "cidr_allowlist",
+        }
+    )
 
     def __init__(self) -> None:
         try:
@@ -64,6 +75,11 @@ class ModalClient:
                 create_kwargs["secrets"] = [
                     modal.Secret.from_dict(config.env_vars)
                 ]
+
+            network_kwargs = _network_kwargs(config.network)
+            if network_kwargs:
+                _require_create_kwargs(modal, network_kwargs)
+            create_kwargs.update(network_kwargs)
 
             if config.backend_options:
                 create_kwargs.update(config.backend_options)
@@ -110,6 +126,46 @@ def _image_from_dockerfile(modal: object, config: SandboxConfig) -> object:
             op="create",
         )
     return from_dockerfile(config.dockerfile, context_dir=config.context_dir)
+
+
+def _require_create_kwargs(modal: object, kwargs: dict) -> None:
+    """Refuse a network policy this Modal SDK's ``Sandbox.create`` can't take.
+
+    The outbound allowlist arguments are newer than the ``modal>=0.60``
+    floor; an older SDK would reject them with a TypeError, so fail as
+    unsupported instead.
+    """
+    try:
+        params = inspect.signature(
+            modal.Sandbox.create  # type: ignore[attr-defined]
+        ).parameters
+    except (TypeError, ValueError):
+        return
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return
+    missing = sorted(k for k in kwargs if k not in params)
+    if missing:
+        raise FeatureNotSupportedError(
+            "This Modal SDK's Sandbox.create does not accept "
+            f"{', '.join(missing)}, so it cannot enforce this network "
+            "policy; upgrade modal",
+            backend="modal",
+            op="create",
+        )
+
+
+def _network_kwargs(policy: NetworkPolicy | None) -> dict:
+    """Map a policy onto ``Sandbox.create`` keyword arguments."""
+    if policy is None or policy.mode == "public":
+        return {}
+    if policy.mode == "none":
+        return {"block_network": True}
+    kwargs: dict = {}
+    if policy.cidrs:
+        kwargs["outbound_cidr_allowlist"] = list(policy.cidrs)
+    if policy.domains:
+        kwargs["outbound_domain_allowlist"] = list(policy.domains)
+    return kwargs
 
 
 class ModalSession:
@@ -238,6 +294,38 @@ class ModalSession:
                 op="expose_port",
             )
         return ExposedPort(port=port, url=url)
+
+    def set_network(self, policy: NetworkPolicy) -> None:
+        """Replace the outbound policy via Modal's experimental API."""
+        setter = getattr(
+            self._sandbox, "_experimental_set_outbound_network_policy", None
+        )
+        if setter is None:
+            raise FeatureNotSupportedError(
+                "This Modal SDK cannot change the network policy of a "
+                "running sandbox",
+                backend="modal",
+                op="set_network",
+            )
+        if policy.mode == "none":
+            raise FeatureNotSupportedError(
+                "Modal blocks all egress only at creation; pass "
+                "network=NetworkPolicy(mode='none') to the constructor",
+                backend="modal",
+                op="set_network",
+            )
+        kwargs: dict = {}
+        if policy.mode == "allowlist":
+            kwargs = {
+                "outbound_cidr_allowlist": list(policy.cidrs) or None,
+                "outbound_domain_allowlist": list(policy.domains) or None,
+            }
+        try:
+            setter(**kwargs)
+        except Exception as exc:
+            raise SandboxExecutionError(
+                f"Modal set_network failed: {exc}"
+            ) from exc
 
     def snapshot(self) -> SnapshotInfo:
         try:
