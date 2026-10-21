@@ -1,6 +1,6 @@
 [project]
 name = "bespokelabs-sandbox"
-version = "0.2.0"
+version = "0.3.0"
 description = "OpenRouter for Sandboxes - Unified Python API for cloud sandbox providers"
 readme = "README.md"
 license = "Apache-2.0"
