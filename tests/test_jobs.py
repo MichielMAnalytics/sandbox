@@ -70,11 +70,12 @@ class JobSpecTests(unittest.TestCase):
         spec = JobSpec(command="true", memory_mb=2048.0, timeout_secs=60.0)
         self.assertEqual((spec.memory_mb, spec.timeout_secs), (2048.0, 60.0))
 
-    def test_rejects_infinite_cpu_and_disk(self) -> None:
-        for field in ("cpu", "disk_mb"):
-            with self.subTest(field=field):
-                with self.assertRaises(SandboxConfigurationError):
-                    JobSpec(command="true", **{field: float("inf")})
+    def test_rejects_infinite_or_oversized_resources(self) -> None:
+        for field in ("cpu", "memory_mb", "timeout_secs", "disk_mb"):
+            for value in (float("inf"), 10**400):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(SandboxConfigurationError):
+                        JobSpec(command="true", **{field: value})
 
     def test_rejects_env_names_the_shell_cannot_export(self) -> None:
         for name in ("1A", "A-B", "A B", ""):

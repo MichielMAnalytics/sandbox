@@ -264,6 +264,14 @@ class SandboxSessionState:
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _is_finite(value: Any) -> bool:
+    """Whether *value* is a finite number that fits in a float."""
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 class JobState(str, Enum):
     """Lifecycle state of a job submitted with ``SandboxClient.submit_job``.
 
@@ -366,9 +374,9 @@ class JobSpec:
             raise SandboxConfigurationError(
                 f"JobSpec.disk_mb must be positive, got {self.disk_mb!r}"
             )
-        for name in ("cpu", "disk_mb"):
+        for name in ("cpu", "memory_mb", "timeout_secs", "disk_mb"):
             value = getattr(self, name)
-            if value is not None and not math.isfinite(value):
+            if value is not None and not _is_finite(value):
                 raise SandboxConfigurationError(
                     f"JobSpec.{name} must be finite, got {value!r}"
                 )
