@@ -7,6 +7,8 @@ the spec, the shared wait loop, and the error every other backend raises.
 from __future__ import annotations
 
 import unittest
+from decimal import Decimal
+from fractions import Fraction
 from unittest import mock
 
 from bespokelabs.sandbox import (
@@ -54,9 +56,10 @@ class JobSpecTests(unittest.TestCase):
 
     def test_rejects_fractional_memory_and_timeout(self) -> None:
         for field in ("memory_mb", "timeout_secs"):
-            with self.subTest(field=field):
-                with self.assertRaises(SandboxConfigurationError):
-                    JobSpec(command="true", **{field: 0.5})
+            for value in (0.5, 1024.5, Decimal("1024.5"), Fraction(3, 2)):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(SandboxConfigurationError):
+                        JobSpec(command="true", **{field: value})
         spec = JobSpec(command="true", memory_mb=2048.0, timeout_secs=60.0)
         self.assertEqual((spec.memory_mb, spec.timeout_secs), (2048.0, 60.0))
 

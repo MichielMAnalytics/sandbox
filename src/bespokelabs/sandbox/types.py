@@ -351,7 +351,7 @@ class JobSpec:
                 )
         for name in ("memory_mb", "timeout_secs"):
             value = getattr(self, name)
-            if isinstance(value, float) and not value.is_integer():
+            if int(value) != value:
                 raise SandboxConfigurationError(
                     f"JobSpec.{name} must be a whole number, got {value!r}"
                 )
