@@ -270,10 +270,19 @@ def _label(value: str) -> str:
 
 def _labels(labels: dict[str, str]) -> dict[str, str]:
     out: dict[str, str] = {}
+    sources: dict[str, str] = {}
     for key, value in labels.items():
         clean_key = _label(key)
         if not clean_key or not clean_key[0].isalpha():
             clean_key = f"l_{clean_key}"[:63]
+        if clean_key in sources:
+            raise SandboxConfigurationError(
+                f"Labels {sources[clean_key]!r} and {key!r} both become the "
+                f"GCP label key {clean_key!r}",
+                backend="gcp_batch",
+                op="submit_job",
+            )
+        sources[clean_key] = key
         out[clean_key] = _label(value)
     return out
 

@@ -41,7 +41,9 @@ _ENV = {"GOOGLE_CLOUD_PROJECT": "proj", "GOOGLE_CLOUD_REGION": "us-central1"}
 
 
 def _when(seconds: int) -> datetime.datetime:
-    return datetime.datetime(2026, 10, 17, 12, 0, seconds, tzinfo=datetime.UTC)
+    return datetime.datetime(
+        2026, 10, 17, 12, 0, seconds, tzinfo=datetime.timezone.utc
+    )
 
 
 def _job(
@@ -244,6 +246,17 @@ class BuildJobTests(GcpBatchTestCase):
         )
         self.assertTrue(nic.no_external_ip_address)
         self.assertEqual(dict(job.labels), {"app": "worker", "run_id": "r1"})
+
+    def test_rejects_labels_that_collide_once_coerced(self) -> None:
+        with self.assertRaises(SandboxConfigurationError) as ctx:
+            self.backend.build_job(
+                JobSpec(
+                    command="x",
+                    image="i",
+                    labels={"Team": "a", "team": "b"},
+                )
+            )
+        self.assertIn("'team'", str(ctx.exception))
 
     def test_scopes_need_a_service_account(self) -> None:
         with self.assertRaises(SandboxConfigurationError):

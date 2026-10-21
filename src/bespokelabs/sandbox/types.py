@@ -349,6 +349,12 @@ class JobSpec:
                 raise SandboxConfigurationError(
                     f"JobSpec.{name} must be positive, got {value!r}"
                 )
+        for name in ("memory_mb", "timeout_secs"):
+            value = getattr(self, name)
+            if isinstance(value, float) and not value.is_integer():
+                raise SandboxConfigurationError(
+                    f"JobSpec.{name} must be a whole number, got {value!r}"
+                )
         if self.disk_mb is not None and (
             isinstance(self.disk_mb, bool) or not self.disk_mb > 0
         ):

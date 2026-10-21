@@ -1273,7 +1273,8 @@ job with one container task; interactive `Sandbox("gcp_batch")` raises
 URI the VMs can pull (e.g. Artifact Registry); `cpu` / `memory_mb` become the
 task's compute resource, `disk_mb` the boot disk, `timeout_secs` its
 `maxRunDuration`, `env_vars` its environment, `labels` the job's and VMs'
-labels (coerced to GCP label syntax), `workdir` the container's `--workdir`,
+labels (coerced to GCP label syntax; keys that collide once coerced
+are rejected), `workdir` the container's `--workdir`,
 and `allow_internet=False` blocks the container's external network. `gpu`
 takes `L4`, `T4`, `V100`, `P100`, `P4`, `A100`, `A100-80GB`, `H100`,
 `H200`, `B200` or a Compute Engine type such as `nvidia-l4`, optionally with

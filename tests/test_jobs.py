@@ -52,6 +52,14 @@ class JobSpecTests(unittest.TestCase):
                     with self.assertRaises(SandboxConfigurationError):
                         JobSpec(command="true", **{field: value})
 
+    def test_rejects_fractional_memory_and_timeout(self) -> None:
+        for field in ("memory_mb", "timeout_secs"):
+            with self.subTest(field=field):
+                with self.assertRaises(SandboxConfigurationError):
+                    JobSpec(command="true", **{field: 0.5})
+        spec = JobSpec(command="true", memory_mb=2048.0, timeout_secs=60.0)
+        self.assertEqual((spec.memory_mb, spec.timeout_secs), (2048.0, 60.0))
+
     def test_rejects_env_names_the_shell_cannot_export(self) -> None:
         for name in ("1A", "A-B", "A B", ""):
             with self.subTest(name=name):
@@ -213,6 +221,14 @@ class ControlPlaneDefaultsTests(unittest.TestCase):
         plane = ControlPlane(store=mock.MagicMock())
         self.assertNotIn("gcp_batch", plane._allowed_backends)
         self.assertIn("local", plane._allowed_backends)
+
+    def test_job_only_backends_are_rejected_when_named(self) -> None:
+        from bespokelabs.sandbox.control_plane.service import ControlPlane
+
+        with self.assertRaisesRegex(ValueError, "gcp_batch"):
+            ControlPlane(
+                store=mock.MagicMock(), allowed_backends=["local", "gcp_batch"]
+            )
 
 
 if __name__ == "__main__":
