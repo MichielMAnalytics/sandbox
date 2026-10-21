@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -351,7 +352,11 @@ class JobSpec:
                 )
         for name in ("memory_mb", "timeout_secs"):
             value = getattr(self, name)
-            if int(value) != value:
+            try:
+                whole = int(value) == value
+            except (OverflowError, TypeError, ValueError):
+                whole = False
+            if not whole:
                 raise SandboxConfigurationError(
                     f"JobSpec.{name} must be a whole number, got {value!r}"
                 )
@@ -361,6 +366,12 @@ class JobSpec:
             raise SandboxConfigurationError(
                 f"JobSpec.disk_mb must be positive, got {self.disk_mb!r}"
             )
+        for name in ("cpu", "disk_mb"):
+            value = getattr(self, name)
+            if value is not None and not math.isfinite(value):
+                raise SandboxConfigurationError(
+                    f"JobSpec.{name} must be finite, got {value!r}"
+                )
         for key, value in self.env_vars.items():
             if not isinstance(key, str) or not _ENV_NAME_RE.fullmatch(key):
                 raise SandboxConfigurationError(
