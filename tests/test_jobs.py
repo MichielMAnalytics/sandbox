@@ -154,6 +154,19 @@ class AsyncUnsupportedBackendTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FeatureNotSupportedError):
                 await client.submit_job(JobSpec(command="true"))
 
+    async def test_async_unsupported_backend_is_named_before_the_spec_is_copied(
+        self,
+    ) -> None:
+        """A spec holding a value deepcopy cannot copy still gets the error."""
+        import threading
+
+        spec = JobSpec(
+            command="true", backend_options={"lock": threading.Lock()}
+        )
+        client = AsyncSandboxClient("ray")
+        with self.assertRaises(FeatureNotSupportedError):
+            await client.submit_job(spec)
+
     async def test_async_submit_builds_from_a_copy_of_the_spec(self) -> None:
         """A caller changing its spec mid-submit changes no job.
 

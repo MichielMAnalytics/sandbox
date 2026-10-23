@@ -406,6 +406,11 @@ class AsyncSandboxClient:
         anything is awaited, so the caller may change *spec* (or its nested
         dicts) while the submit is in flight without changing the job.
         """
+        # The support check first, so an unsupported backend says so whatever
+        # the spec holds; then the copy, before anything is awaited.
+        _jobs.check_supports_jobs(
+            self._backend_name, BACKENDS[self._backend_name], "submit_job"
+        )
         spec = copy.deepcopy(spec)
         runner = await self._jobs("submit_job")
         return await asyncio.to_thread(runner.submit_job, spec)
