@@ -153,6 +153,29 @@ class AsyncUnsupportedBackendTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(FeatureNotSupportedError):
                 await client.submit_job(JobSpec(command="true"))
 
+    async def test_async_submit_builds_from_a_copy_of_the_spec(self) -> None:
+        """A caller changing its spec while the submit runs changes no job."""
+        seen: list[JobSpec] = []
+        spec = JobSpec(command="true", env_vars={"A": "1"}, labels={"t": "a"})
+
+        class Runner:
+
+            def submit_job(self, given: JobSpec) -> str:
+                seen.append(given)
+                return "job-1"
+
+        client = AsyncSandboxClient("gcp_batch")
+
+        async def jobs(op: str) -> Runner:
+            return Runner()
+
+        with mock.patch.object(client, "_jobs", jobs):
+            self.assertEqual(await client.submit_job(spec), "job-1")
+        self.assertIsNot(seen[0], spec)
+        self.assertIsNot(seen[0].env_vars, spec.env_vars)
+        spec.env_vars["A"] = "2"
+        self.assertEqual(seen[0].env_vars, {"A": "1"})
+
 
 class WaitPolicyTests(unittest.TestCase):
 

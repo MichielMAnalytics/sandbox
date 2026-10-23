@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar, overload
@@ -399,9 +400,14 @@ class AsyncSandboxClient:
     # -- Jobs --------------------------------------------------------------
 
     async def submit_job(self, spec: JobSpec) -> str:
-        """Async version of :meth:`SandboxClient.submit_job`."""
+        """Async version of :meth:`SandboxClient.submit_job`.
+
+        The job is built from a copy of *spec* taken before the worker thread
+        starts, so the caller may change *spec* (or its nested dicts) while
+        the submit is in flight without changing the job.
+        """
         runner = await self._jobs("submit_job")
-        return await asyncio.to_thread(runner.submit_job, spec)
+        return await asyncio.to_thread(runner.submit_job, copy.deepcopy(spec))
 
     async def job_status(self, job_id: str) -> JobStatus:
         """Async version of :meth:`SandboxClient.job_status`."""
