@@ -402,12 +402,13 @@ class AsyncSandboxClient:
     async def submit_job(self, spec: JobSpec) -> str:
         """Async version of :meth:`SandboxClient.submit_job`.
 
-        The job is built from a copy of *spec* taken before the worker thread
-        starts, so the caller may change *spec* (or its nested dicts) while
-        the submit is in flight without changing the job.
+        The job is built from a copy of *spec* taken at the call, before
+        anything is awaited, so the caller may change *spec* (or its nested
+        dicts) while the submit is in flight without changing the job.
         """
+        spec = copy.deepcopy(spec)
         runner = await self._jobs("submit_job")
-        return await asyncio.to_thread(runner.submit_job, copy.deepcopy(spec))
+        return await asyncio.to_thread(runner.submit_job, spec)
 
     async def job_status(self, job_id: str) -> JobStatus:
         """Async version of :meth:`SandboxClient.job_status`."""

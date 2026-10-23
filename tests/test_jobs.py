@@ -6,6 +6,7 @@ the spec, the shared wait loop, and the error every other backend raises.
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from decimal import Decimal
 from fractions import Fraction
@@ -154,9 +155,15 @@ class AsyncUnsupportedBackendTests(unittest.IsolatedAsyncioTestCase):
                 await client.submit_job(JobSpec(command="true"))
 
     async def test_async_submit_builds_from_a_copy_of_the_spec(self) -> None:
-        """A caller changing its spec while the submit runs changes no job."""
+        """A caller changing its spec mid-submit changes no job.
+
+        The submit is held on the backend client's construction while the
+        caller changes the spec.
+        """
         seen: list[JobSpec] = []
         spec = JobSpec(command="true", env_vars={"A": "1"}, labels={"t": "a"})
+        building = asyncio.Event()
+        built = asyncio.Event()
 
         class Runner:
 
@@ -167,14 +174,20 @@ class AsyncUnsupportedBackendTests(unittest.IsolatedAsyncioTestCase):
         client = AsyncSandboxClient("gcp_batch")
 
         async def jobs(op: str) -> Runner:
+            building.set()
+            await built.wait()
             return Runner()
 
         with mock.patch.object(client, "_jobs", jobs):
-            self.assertEqual(await client.submit_job(spec), "job-1")
+            submit = asyncio.create_task(client.submit_job(spec))
+            await building.wait()
+            spec.env_vars["A"] = "2"
+            spec.labels["t"] = "b"
+            built.set()
+            self.assertEqual(await submit, "job-1")
         self.assertIsNot(seen[0], spec)
-        self.assertIsNot(seen[0].env_vars, spec.env_vars)
-        spec.env_vars["A"] = "2"
         self.assertEqual(seen[0].env_vars, {"A": "1"})
+        self.assertEqual(seen[0].labels, {"t": "a"})
 
 
 class WaitPolicyTests(unittest.TestCase):
