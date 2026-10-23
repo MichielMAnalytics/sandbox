@@ -6,6 +6,8 @@ from typing import Protocol, runtime_checkable
 
 from bespokelabs.sandbox.types import (
     FileInfo,
+    JobSpec,
+    JobStatus,
     SandboxConfig,
     SandboxResult,
     SnapshotInfo,
@@ -72,4 +74,31 @@ class SandboxBackendClient(Protocol):
         ...
 
     def resume(self, data: dict) -> SandboxBackendSession:
+        ...
+
+
+@runtime_checkable
+class SandboxJobBackend(Protocol):
+    """A backend client that runs detached jobs natively (e.g. ``gcp_batch``).
+
+    ``SandboxClient``'s job methods raise ``FeatureNotSupportedError`` on a
+    backend client without these methods.
+
+    ``submit_job`` returns a job id that any process can pass to the other
+    methods; it must carry everything needed to find the job again.
+    ``cancel_job`` stops the job and returns its status after the request:
+    terminal where cancellation is synchronous, or ``running`` with a
+    ``cancelling`` reason where the provider cancels asynchronously.
+    """
+
+    def submit_job(self, spec: JobSpec) -> str:
+        ...
+
+    def job_status(self, job_id: str) -> JobStatus:
+        ...
+
+    def job_logs(self, job_id: str, tail: int | None) -> str:
+        ...
+
+    def cancel_job(self, job_id: str) -> JobStatus:
         ...

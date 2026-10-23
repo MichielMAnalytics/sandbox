@@ -8,10 +8,11 @@ import re
 import shlex
 import time
 import typing
+from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar, overload
+from typing import Any, TypeVar, overload
 
-from bespokelabs.sandbox import _transfer, pricing
+from bespokelabs.sandbox import _jobs, _transfer, pricing
 from bespokelabs.sandbox._usage import (
     parse_claude_result,
     parse_opencode_result,
@@ -48,6 +49,8 @@ from bespokelabs.sandbox.types import (
     AgentRunResult,
     ExposedPort,
     FileInfo,
+    JobSpec,
+    JobStatus,
     NetworkPolicy,
     SandboxConfig,
     SandboxResult,
@@ -876,6 +879,77 @@ class SandboxClient:
         return Sandbox._resume_with(
             self._backend_name, self._backend_client, state
         )
+
+    # -- Jobs --------------------------------------------------------------
+
+    def submit_job(self, spec: JobSpec) -> str:
+        """Start *spec*'s command detached and return its job id at once.
+
+        Only ``gcp_batch`` runs jobs (as Google Cloud Batch jobs); every
+        other backend raises :class:`FeatureNotSupportedError`.  The job
+        keeps running when this process exits.  The id is the Batch job's
+        resource name: store it, and any process can later pass it to
+        :meth:`job_status`, :meth:`wait_job`, :meth:`job_logs` or
+        :meth:`cancel_job` on a ``SandboxClient("gcp_batch")``.
+        """
+        return self._jobs("submit_job").submit_job(spec)
+
+    def job_status(self, job_id: str) -> JobStatus:
+        """Read a job's current state from its provider.
+
+        A provider job that no longer exists is reported as
+        ``JobState.UNKNOWN`` (``reason`` says why), never as success.
+        Transient provider failures raise; :meth:`wait_job` rides them out.
+        """
+        return self._jobs("job_status").job_status(job_id)
+
+    def wait_job(
+        self,
+        job_id: str,
+        timeout_secs: float | None = None,
+        poll_secs: float = 10.0,
+        *,
+        on_poll: Callable[[JobStatus], Any] | None = None,
+    ) -> JobStatus:
+        """Poll until the job reaches a terminal state and return that status.
+
+        ``timeout_secs=None`` waits indefinitely; otherwise
+        :class:`SandboxTimeoutError` is raised when it elapses with the job
+        still running.  ``on_poll`` is called with every status read (e.g. to
+        report progress to an orchestrator).  Before the job has been seen,
+        four consecutive provider read failures are retried and the fifth
+        raises; once it has, read failures are retried with backoff until the
+        deadline.
+        """
+        runner = self._jobs("wait_job")
+        return _jobs.wait_sync(
+            runner.job_status,
+            job_id,
+            timeout_secs=timeout_secs,
+            poll_secs=poll_secs,
+            on_poll=on_poll,
+        )
+
+    def job_logs(self, job_id: str, tail: int | None = None) -> str:
+        """Return the job's combined stdout/stderr, or its last *tail* lines."""
+        runner = self._jobs("job_logs")
+        if tail is not None and tail < 0:
+            raise SandboxConfigurationError("tail must be >= 0")
+        return runner.job_logs(job_id, tail)
+
+    def cancel_job(self, job_id: str) -> JobStatus:
+        """Stop the job and release its resources; return its status after.
+
+        ``gcp_batch`` cancels asynchronously: the result is ``running`` with
+        ``reason="cancelling"`` until Batch settles the job as ``cancelled``
+        (``wait_job`` to see it).  A finished job keeps its state, and
+        cancelling a job that is already gone returns its ``unknown`` status
+        rather than raising.
+        """
+        return self._jobs("cancel_job").cancel_job(job_id)
+
+    def _jobs(self, op: str) -> Any:
+        return _jobs.job_runner(self._backend_name, self._backend_client, op)
 
 
 def _resolve_dockerfile(

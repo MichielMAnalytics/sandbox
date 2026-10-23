@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
+import re
 from dataclasses import dataclass, field
-from typing import Literal
+from datetime import datetime
+from enum import Enum
+from typing import Any, Literal
 
 from bespokelabs.sandbox.exceptions import SandboxConfigurationError
 
@@ -253,3 +257,167 @@ class SandboxSessionState:
     def from_json(cls, raw: str) -> SandboxSessionState:
         obj = json.loads(raw)
         return cls(backend=obj["backend"], data=obj["data"])
+
+
+# -- Jobs ----------------------------------------------------------------------
+
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_finite(value: Any) -> bool:
+    """Whether *value* is a finite number that fits in a float."""
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+class JobState(str, Enum):
+    """Lifecycle state of a job submitted with ``SandboxClient.submit_job``.
+
+    ``succeeded`` and ``failed`` normally come from the command's own exit
+    code (``failed`` includes a command stopped by its ``timeout_secs``).
+    A provider can also fail a job the command never ran in (Cloud Batch:
+    ``exit_code=None``, ``reason="batch_failed"``, with the provider's
+    message in ``details["message"]``).
+    ``cancelled`` follows ``cancel_job``.  ``unknown`` is terminal and means
+    the outcome can no longer be established (the provider job is gone).  It
+    is never a guess at success; ``JobStatus.reason`` says why.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    UNKNOWN = "unknown"
+
+
+TERMINAL_JOB_STATES = frozenset(
+    {
+        JobState.SUCCEEDED,
+        JobState.FAILED,
+        JobState.CANCELLED,
+        JobState.UNKNOWN,
+    }
+)
+
+
+@dataclass
+class JobSpec:
+    """A command to run to completion, detached from the submitting process.
+
+    Resource fields mean what they mean on :class:`SandboxConfig`.  Jobs
+    run on ``gcp_batch`` only; the README maps each field onto Cloud Batch.
+
+      - command: an argv list (run without a shell) or a shell string (run
+        with ``sh -c``).
+      - image: the container image the job runs in.
+      - env_vars: literal values exported for the command only.  Names must
+        be valid shell identifiers.
+      - timeout_secs: the command's own run-time limit.
+      - labels: provider labels (Cloud Batch job and VM labels).
+      - workdir: the command's working directory.
+      - backend_options: provider settings; see the README for the
+        ``gcp_batch`` keys.
+    """
+
+    command: str | list[str]
+    image: str | None = None
+    env_vars: dict[str, str] = field(default_factory=dict)
+    cpu: float = 1.0
+    memory_mb: int = 1024
+    disk_mb: int | None = None
+    gpu: str | None = None
+    timeout_secs: int = 3600
+    allow_internet: bool = True
+    labels: dict[str, str] = field(default_factory=dict)
+    workdir: str | None = None
+    backend_options: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.command, str):
+            if not self.command.strip():
+                raise SandboxConfigurationError("JobSpec.command is empty")
+        elif isinstance(self.command, (list, tuple)):
+            if not self.command or not all(
+                isinstance(part, str) for part in self.command
+            ):
+                raise SandboxConfigurationError(
+                    "JobSpec.command must be a shell string or a non-empty "
+                    "list of strings"
+                )
+            self.command = list(self.command)
+        else:
+            raise SandboxConfigurationError(
+                "JobSpec.command must be a shell string or a list of strings"
+            )
+        for name in ("cpu", "memory_mb", "timeout_secs"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not value > 0:
+                raise SandboxConfigurationError(
+                    f"JobSpec.{name} must be positive, got {value!r}"
+                )
+        for name in ("memory_mb", "timeout_secs"):
+            value = getattr(self, name)
+            try:
+                whole = int(value) == value
+            except (OverflowError, TypeError, ValueError):
+                whole = False
+            if not whole:
+                raise SandboxConfigurationError(
+                    f"JobSpec.{name} must be a whole number, got {value!r}"
+                )
+        if self.disk_mb is not None and (
+            isinstance(self.disk_mb, bool) or not self.disk_mb > 0
+        ):
+            raise SandboxConfigurationError(
+                f"JobSpec.disk_mb must be positive, got {self.disk_mb!r}"
+            )
+        for name in ("cpu", "memory_mb", "timeout_secs", "disk_mb"):
+            value = getattr(self, name)
+            if value is not None and not _is_finite(value):
+                raise SandboxConfigurationError(
+                    f"JobSpec.{name} must be finite, got {value!r}"
+                )
+        for key, value in self.env_vars.items():
+            if not isinstance(key, str) or not _ENV_NAME_RE.fullmatch(key):
+                raise SandboxConfigurationError(
+                    f"JobSpec.env_vars name {key!r} is not a valid variable "
+                    "name"
+                )
+            if not isinstance(value, str):
+                raise SandboxConfigurationError(
+                    f"JobSpec.env_vars[{key!r}] must be a string"
+                )
+        for key, value in self.labels.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise SandboxConfigurationError(
+                    "JobSpec.labels keys and values must be strings"
+                )
+
+
+@dataclass
+class JobStatus:
+    """A job's state as last observed from its provider.
+
+    ``exit_code`` is the command's exit code once it is known.
+    ``started_at`` / ``finished_at`` are timezone-aware UTC times when the
+    provider reports them.  ``reason`` is a short machine-readable cause for
+    non-success terminal states (e.g. ``"timeout"``, ``"job_not_found"``).
+    ``details`` carries provider-specific facts such as the raw provider
+    state.
+    """
+
+    job_id: str
+    state: JobState
+    exit_code: int | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    reason: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def done(self) -> bool:
+        """Whether the job reached a terminal state."""
+        return self.state in TERMINAL_JOB_STATES

@@ -23,9 +23,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import copy
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar, overload
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
+from bespokelabs.sandbox import _jobs
 from bespokelabs.sandbox.backends import BACKENDS
 from bespokelabs.sandbox.exceptions import SandboxConfigurationError
 from bespokelabs.sandbox.presets import SandboxPreset
@@ -35,6 +38,8 @@ from bespokelabs.sandbox.types import (
     AgentRunResult,
     ExposedPort,
     FileInfo,
+    JobSpec,
+    JobStatus,
     NetworkPolicy,
     SandboxResult,
     SandboxSessionState,
@@ -392,7 +397,73 @@ class AsyncSandboxClient:
         )
         return AsyncSandbox(sandbox)
 
+    # -- Jobs --------------------------------------------------------------
+
+    async def submit_job(self, spec: JobSpec) -> str:
+        """Async version of :meth:`SandboxClient.submit_job`.
+
+        The job is built from a copy of *spec* taken at the call, before
+        anything is awaited, so the caller may change *spec* (or its nested
+        dicts) while the submit is in flight without changing the job.
+        """
+        # The support check first, so an unsupported backend says so whatever
+        # the spec holds; then the copy, before anything is awaited.
+        _jobs.check_supports_jobs(
+            self._backend_name, BACKENDS[self._backend_name], "submit_job"
+        )
+        spec = copy.deepcopy(spec)
+        runner = await self._jobs("submit_job")
+        return await asyncio.to_thread(runner.submit_job, spec)
+
+    async def job_status(self, job_id: str) -> JobStatus:
+        """Async version of :meth:`SandboxClient.job_status`."""
+        runner = await self._jobs("job_status")
+        return await asyncio.to_thread(runner.job_status, job_id)
+
+    async def wait_job(
+        self,
+        job_id: str,
+        timeout_secs: float | None = None,
+        poll_secs: float = 10.0,
+        *,
+        on_poll: Callable[[JobStatus], Any] | None = None,
+    ) -> JobStatus:
+        """Async version of :meth:`SandboxClient.wait_job`.
+
+        Sleeps on the event loop between polls.  ``on_poll`` may be a plain
+        function or a coroutine function.
+        """
+        runner = await self._jobs("wait_job")
+        return await _jobs.wait_async(
+            runner.job_status,
+            job_id,
+            timeout_secs=timeout_secs,
+            poll_secs=poll_secs,
+            on_poll=on_poll,
+        )
+
+    async def job_logs(self, job_id: str, tail: int | None = None) -> str:
+        """Async version of :meth:`SandboxClient.job_logs`."""
+        runner = await self._jobs("job_logs")
+        if tail is not None and tail < 0:
+            raise SandboxConfigurationError("tail must be >= 0")
+        return await asyncio.to_thread(runner.job_logs, job_id, tail)
+
+    async def cancel_job(self, job_id: str) -> JobStatus:
+        """Async version of :meth:`SandboxClient.cancel_job`."""
+        runner = await self._jobs("cancel_job")
+        return await asyncio.to_thread(runner.cancel_job, job_id)
+
     # -- Internal ----------------------------------------------------------
+
+    async def _jobs(self, op: str) -> Any:
+        # Before constructing the client, so a backend without jobs says so
+        # even when its optional SDK is not installed.
+        _jobs.check_supports_jobs(
+            self._backend_name, BACKENDS[self._backend_name], op
+        )
+        backend_client = await self._get_backend_client()
+        return _jobs.job_runner(self._backend_name, backend_client, op)
 
     async def _get_backend_client(self) -> SandboxBackendClient:
         # Double-checked so only the first construction (SDK import,
