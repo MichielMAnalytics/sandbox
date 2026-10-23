@@ -1280,7 +1280,12 @@ takes `L4`, `T4`, `V100`, `P100`, `P4`, `A100`, `A100-80GB`, `H100`,
 `H200`, `B200` or a Compute Engine type such as `nvidia-l4`, optionally with
 `:<count>`; Batch installs the driver, and the smallest machine type with that
 GPU count that fits `cpu` and `memory_mb` is chosen (H100 counts below 8 need
-`provisioning_model` `SPOT` or `FLEX_START`). Pin an image by digest (`.../repo/image@sha256:...`) to run exactly what was
+`provisioning_model` `SPOT` or `FLEX_START`). An accelerator-optimized machine
+type (A2, A3, A4, G2) carries its GPUs, so the job names only the machine type;
+T4, V100, P100 and P4 attach to an N1 VM as accelerators. GPUs reach the
+container through Batch's own driver install; check that the image sees them
+(`nvidia-smi`) before relying on it, and add `--gpus all` through
+`container_options` if it does not. Pin an image by digest (`.../repo/image@sha256:...`) to run exactly what was
 built. Status maps Batch's job state;
 the exit code comes from the task, and Batch's reserved exit codes become
 reasons (`50005` is `"timeout"`, `50001` `"vm_preempted"`, ...). Logs are read

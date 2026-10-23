@@ -276,15 +276,30 @@ class BuildJobTests(GcpBatchTestCase):
         self.assertEqual(container.entrypoint, "/bin/sh")
         self.assertEqual(list(container.commands), ["-c", "echo hi && exit 3"])
 
-    def test_gpu_picks_accelerators_drivers_and_machine(self) -> None:
+    def test_gpu_picks_drivers_and_machine(self) -> None:
+        # Accelerator-optimized machine types carry their GPUs: the machine
+        # type alone sizes them, as in Batch's own GPU examples.
         job = self.backend.build_job(
             JobSpec(command="nvidia-smi", image="img", gpu="L4", cpu=6)
         )
         instance = job.allocation_policy.instances[0]
         self.assertTrue(instance.install_gpu_drivers)
         self.assertEqual(instance.policy.machine_type, "g2-standard-8")
-        accel = instance.policy.accelerators[0]
-        self.assertEqual((accel.type_, accel.count), ("nvidia-l4", 1))
+        self.assertEqual(list(instance.policy.accelerators), [])
+
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="img",
+                gpu="A100-80GB",
+                cpu=8,
+                memory_mb=32 * 1024,
+            )
+        )
+        instance = job.allocation_policy.instances[0]
+        self.assertTrue(instance.install_gpu_drivers)
+        self.assertEqual(instance.policy.machine_type, "a2-ultragpu-1g")
+        self.assertEqual(list(instance.policy.accelerators), [])
 
         job = self.backend.build_job(
             JobSpec(
@@ -296,7 +311,34 @@ class BuildJobTests(GcpBatchTestCase):
         )
         policy = job.allocation_policy.instances[0].policy
         self.assertEqual(policy.machine_type, "a3-megagpu-8g")
-        self.assertEqual(policy.accelerators[0].type_, "nvidia-h100-80gb")
+        self.assertEqual(list(policy.accelerators), [])
+
+    def test_n1_gpus_attach_as_accelerators(self) -> None:
+        job = self.backend.build_job(
+            JobSpec(command="x", image="img", gpu="T4:2", cpu=4)
+        )
+        instance = job.allocation_policy.instances[0]
+        self.assertTrue(instance.install_gpu_drivers)
+        accel = instance.policy.accelerators[0]
+        self.assertEqual((accel.type_, accel.count), ("nvidia-tesla-t4", 2))
+        self.assertTrue(instance.policy.machine_type.startswith("n1-"))
+
+    def test_a_driver_version_lists_the_gpus(self) -> None:
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="img",
+                gpu="A100-80GB",
+                backend_options={"gpu_driver_version": "LATEST"},
+            )
+        )
+        policy = job.allocation_policy.instances[0].policy
+        self.assertEqual(policy.machine_type, "a2-ultragpu-1g")
+        accel = policy.accelerators[0]
+        self.assertEqual(
+            (accel.type_, accel.count, accel.driver_version),
+            ("nvidia-a100-80gb", 1, "LATEST"),
+        )
 
     def test_rejections(self) -> None:
         cases = [

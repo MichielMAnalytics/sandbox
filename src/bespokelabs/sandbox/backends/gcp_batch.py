@@ -481,12 +481,18 @@ class GcpBatchClient:
         machine_type = options.get("machine_type")
         if spec.gpu:
             accelerator, count = parse_gpu(spec.gpu)
-            accel = batch.AllocationPolicy.Accelerator(
-                type_=accelerator, count=count
-            )
-            if options.get("gpu_driver_version"):
-                accel.driver_version = str(options["gpu_driver_version"])
-            policy.accelerators = [accel]
+            # An accelerator-optimized machine type (A2, A3, A4, G2) carries
+            # its GPUs, and Batch's own examples size it by machine type
+            # alone; only an N1 VM has GPUs attached as accelerators.  The
+            # driver version is an accelerator's field, so naming one lists
+            # the GPUs either way.
+            if accelerator in _N1_GPUS or options.get("gpu_driver_version"):
+                accel = batch.AllocationPolicy.Accelerator(
+                    type_=accelerator, count=count
+                )
+                if options.get("gpu_driver_version"):
+                    accel.driver_version = str(options["gpu_driver_version"])
+                policy.accelerators = [accel]
             install_drivers = True
             machine_type = machine_type or machine_type_for(
                 accelerator, count, spec.cpu, spec.memory_mb
