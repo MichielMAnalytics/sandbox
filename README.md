@@ -74,6 +74,7 @@ pip install 'bespokelabs-sandbox[modal]'
 pip install 'bespokelabs-sandbox[e2b]'
 pip install 'bespokelabs-sandbox[ray]'
 pip install 'bespokelabs-sandbox[boxd]'
+pip install 'bespokelabs-sandbox[gcp-batch]'   # detached jobs on Google Cloud Batch
 pip install 'bespokelabs-sandbox[all]'
 ```
 
@@ -113,6 +114,7 @@ the runtime requirements listed below.
 | [RunPod](https://www.runpod.io) | _(none)_ | `RUNPOD_API_KEY` + registered SSH key |
 | [E2B](https://e2b.dev) | `[e2b]` | `E2B_API_KEY` |
 | [boxd](https://boxd.sh) | `[boxd]` | `BOXD_API_KEY` |
+| [Google Cloud Batch](https://cloud.google.com/batch) (jobs only) | `[gcp-batch]` | Application Default Credentials |
 
 You only need to install the backend you use. The others are lazily imported.
 
@@ -1246,6 +1248,120 @@ destroying either affects the other.
 | Local, Safehouse | host workdir | `workdir`, env overlay |
 | Ray | — (not supported) | raises `FeatureNotSupportedError` |
 
+### Detached jobs (Google Cloud Batch)
+
+A job runs one command to completion without the submitting process staying
+attached, like an AWS Batch job. Jobs run on the `gcp_batch` backend, as
+Google Cloud Batch jobs on GCP VMs; every other backend raises
+`FeatureNotSupportedError` ("does not support jobs") from the job methods.
+Submit returns a job id at once; the job keeps running if your process exits,
+and any process holding the id can check on it, wait for it, read its logs,
+or cancel it. This is the reattach path for a worker that restarts mid-job.
+
+```python
+from bespokelabs.sandbox import JobSpec, SandboxClient
+
+client = SandboxClient("gcp_batch")
+job_id = client.submit_job(JobSpec(
+    command=["python", "train.py", "--epochs", "3"],   # argv, or a shell string
+    image="us-docker.pkg.dev/my-project/repo/trainer@sha256:...",
+    env_vars={"WANDB_API_KEY": key},                   # exported for the command
+    cpu=4, memory_mb=8192, timeout_secs=2 * 3600,
+    labels={"team": "evals"},
+    backend_options={"project": "my-project", "region": "us-central1"},
+))
+# ... store job_id (a plain string) anywhere ...
+
+# Later, possibly in a new process:
+client = SandboxClient("gcp_batch")
+status = client.wait_job(job_id, timeout_secs=3 * 3600, poll_secs=30,
+                         on_poll=lambda s: print(s.state.value))
+print(status.state, status.exit_code, status.reason)
+print(client.job_logs(job_id, tail=100))     # combined stdout + stderr
+client.cancel_job(job_id)                    # stop it
+```
+
+| Method | Returns |
+|---|---|
+| `submit_job(spec: JobSpec)` | job id (`str`) |
+| `job_status(job_id)` | `JobStatus` |
+| `wait_job(job_id, timeout_secs=None, poll_secs=10.0, *, on_poll=None)` | terminal `JobStatus`; `SandboxTimeoutError` if `timeout_secs` passes first |
+| `job_logs(job_id, tail=None)` | combined stdout/stderr (`str`), or its last `tail` lines |
+| `cancel_job(job_id)` | `JobStatus` after the cancel request |
+
+`AsyncSandboxClient` has the same methods as coroutines; its `wait_job` sleeps
+on the event loop and accepts a coroutine `on_poll`.
+
+`JobStatus.state` is a `JobState`: `pending`, `running`, `succeeded`,
+`failed`, `cancelled` or `unknown`. `succeeded` and `failed` normally come from the
+command's own exit code (`reason="timeout"` when `timeout_secs` stopped it);
+Cloud Batch can also fail a job whose command never ran, with
+`exit_code=None` and `reason="batch_failed"`.
+`unknown` is terminal and means the outcome can no longer be established: the
+Batch job is gone (`reason="job_not_found"`). It is never reported as success.
+`JobStatus.done` is true for every terminal state; `started_at` /
+`finished_at` are UTC datetimes when known, and `details` carries provider
+facts such as the raw Batch state (`details["batch_state"]`) and, on
+`gcp_batch`, the job's labels as Batch stored them (`details["labels"]`), so a
+caller can check a job is one it started before it cancels it.
+
+`wait_job` rides out provider hiccups: before the job has been seen, four
+consecutive failed reads are retried and the fifth raises; once it has been
+seen, failed reads are retried with backoff (capped at 60s) until the deadline. Configuration,
+authentication and not-installed errors raise at once.
+
+**How a Batch job runs.** `SandboxClient("gcp_batch")` runs each job as a Batch
+job with one container task; interactive `Sandbox("gcp_batch")` raises
+`FeatureNotSupportedError`. The job id is the job's resource name,
+`projects/<project>/locations/<region>/jobs/<id>`. `image` is any container
+URI the VMs can pull (e.g. Artifact Registry); `cpu` / `memory_mb` become the
+task's compute resource, `disk_mb` the boot disk, `timeout_secs` its
+`maxRunDuration`, `env_vars` its environment, `labels` the job's and VMs'
+labels (coerced to GCP label syntax; keys that collide once coerced
+are rejected), `workdir` the container's `--workdir`,
+and `allow_internet=False` blocks the container's external network. `gpu`
+takes `L4`, `T4`, `V100`, `P100`, `P4`, `A100`, `A100-80GB`, `H100`,
+`H200`, `B200` or a Compute Engine type such as `nvidia-l4`, optionally with
+`:<count>`; Batch installs the driver, and the smallest machine type with that
+GPU count that fits `cpu` and `memory_mb` is chosen (H100 counts below 8 need
+`provisioning_model` `SPOT` or `FLEX_START`). An accelerator-optimized machine
+type (A2, A3, A4, G2) carries its GPUs, so the job names only the machine type;
+T4, V100, P100 and P4 attach to an N1 VM as accelerators. GPUs reach the
+container through Batch's own driver install; check that the image sees them
+(`nvidia-smi`) before relying on it, and add `--gpus all` through
+`container_options` if it does not. Pin an image by digest (`.../repo/image@sha256:...`) to run exactly what was
+built. Status maps Batch's job state;
+the exit code comes from the task, and Batch's reserved exit codes become
+reasons (`50005` is `"timeout"`, `50001` `"vm_preempted"`, ...). Logs are read
+from Cloud Logging (`batch_task_logs`, by job uid) and may lag a few seconds.
+`cancel_job` uses Batch's CancelJob on a pending or running job and keeps its
+record. Batch cancels asynchronously, so `cancel_job` (and `job_status`)
+return `running` with `reason="cancelling"` while it stops the VMs, then
+`job_status` reads `cancelled`; `wait_job` after `cancel_job` to confirm. If
+the installed SDK or the service lacks CancelJob, the job is deleted instead
+(`reason="deleting"`, again what `job_status` says while Batch deletes it)
+and later reads as `unknown` /
+`"job_not_found"`. When Batch reports an event description, the status
+carries the latest one in `details["message"]` (for a failure, why it failed:
+the task's exit, or the job-level cause when no task exited); the key is
+absent when Batch has given none, so read it with `details.get("message")`. Files reach the job through the
+image or Cloud Storage. Credentials are Application Default Credentials.
+
+| `backend_options` key | Meaning |
+|---|---|
+| `project`, `region` | Where to submit (else `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_REGION` or `CLOUDSDK_COMPUTE_REGION`) |
+| `service_account` | Service account email the VMs run as (it needs Artifact Registry read and whatever the job touches, e.g. GCS) |
+| `service_account_scopes` | OAuth scopes for that service account (list) |
+| `network`, `subnetwork` | VPC network and subnetwork for the VMs (`projects/<p>/global/networks/<n>`, `projects/<p>/regions/<r>/subnetworks/<s>`) |
+| `no_external_ip` | `True` gives the VMs no external IP; the subnet then needs Private Google Access (Artifact Registry, GCS) or Cloud NAT |
+| `machine_type` | Overrides the chosen machine type |
+| `provisioning_model` | `STANDARD`, `SPOT`, `PREEMPTIBLE` or `FLEX_START` |
+| `allowed_locations` | e.g. `["zones/us-central1-a"]` |
+| `max_retry_count` | Task retries (default 0) |
+| `container_options` | Extra `docker run` options |
+| `gpu_driver_version` | GPU driver version for Batch to install |
+| `job_id`, `job_id_prefix` | Explicit Batch job id, or its prefix (default `job`) |
+
 ### Snapshots
 
 ```python
@@ -1444,6 +1560,11 @@ export E2B_API_KEY=your_key
 # boxd
 export BOXD_API_KEY=your_key
 export BOXD_ORG=your_org      # optional; picks the org for a BOXD_TOKEN session
+
+# Google Cloud Batch (jobs) — Application Default Credentials
+gcloud auth application-default login
+export GOOGLE_CLOUD_PROJECT=your-project
+export GOOGLE_CLOUD_REGION=us-central1
 ```
 
 ## Envy notifications for agents
@@ -1512,7 +1633,8 @@ The test suite exercises Python/API behavior and dashboard asset contracts;
 |---|---|
 | `src/bespokelabs/sandbox/sandbox.py` | Direct SDK, lifecycle, workspace setup, structured output, agent cost tracking |
 | `src/bespokelabs/sandbox/aio.py` | Thread-backed async client and session wrapper |
-| `src/bespokelabs/sandbox/backends/` | Nine lazy-loaded provider clients and sessions |
+| `src/bespokelabs/sandbox/backends/` | Lazy-loaded provider clients and sessions, plus the job-only Google Cloud Batch client |
+| `src/bespokelabs/sandbox/_jobs.py` | Job backend lookup and the shared `wait_job` loop |
 | `src/bespokelabs/sandbox/protocols.py`, `types.py`, `exceptions.py` | Backend contracts and shared public types/errors |
 | `src/bespokelabs/sandbox/workspace.py`, `_transfer.py` | Manifest entries and directory transfer strategies |
 | `src/bespokelabs/sandbox/agents.py`, `_agent_runtime.py`, `_usage.py` | Agent placement, command preparation, Claude/OpenCode usage parsing |

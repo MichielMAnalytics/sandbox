@@ -1,6 +1,6 @@
 [project]
 name = "bespokelabs-sandbox"
-version = "0.2.0"
+version = "0.3.0"
 description = "OpenRouter for Sandboxes - Unified Python API for cloud sandbox providers"
 readme = "README.md"
 license = "Apache-2.0"
@@ -11,7 +11,7 @@ dependencies = [
 authors = [
     { name = "Bespoke Labs" },
 ]
-keywords = ["sandbox", "cloud", "daytona", "modal", "runpod", "e2b", "tensorlake", "docker", "ray", "safehouse", "boxd", "bespokelabs"]
+keywords = ["sandbox", "cloud", "daytona", "modal", "runpod", "e2b", "tensorlake", "docker", "ray", "safehouse", "boxd", "gcp-batch", "bespokelabs"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -31,6 +31,7 @@ e2b = ["e2b-code-interpreter>=1.0.0"]
 docker = ["docker>=7.0.0"]
 ray = ["ray>=2.0.0"]
 boxd = ["boxd>=0.2.18"]
+gcp-batch = ["google-cloud-batch>=0.17.0", "google-cloud-logging>=3.0.0"]
 server = ["fastapi>=0.115.0", "uvicorn>=0.30.0"]
 all = [
     "daytona>=0.207.0",
@@ -40,6 +41,8 @@ all = [
     "docker>=7.0.0",
     "ray>=2.0.0",
     "boxd>=0.2.18",
+    "google-cloud-batch>=0.17.0",
+    "google-cloud-logging>=3.0.0",
 ]
 dev = [
     "httpx>=0.27.0,<1",
