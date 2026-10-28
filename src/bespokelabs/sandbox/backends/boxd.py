@@ -129,13 +129,16 @@ def _classify_boxd_error(
 ) -> SandboxError:
     """Translate boxd SDK exception types into the public error taxonomy.
 
-    ``missing`` is the type a boxd ``NotFoundError`` becomes: a missing
-    machine is ``SandboxNotFoundError``, a missing file is an execution error,
-    as on the other backends.
+    ``missing`` is the type a boxd ``NotFoundError`` for the machine becomes.
+    A failure inside the machine's filesystem (a missing file, a directory, a
+    path the ``boxd`` user may not touch) is an execution error, as on the
+    other backends, never a credentials or machine problem.
     """
-    from boxd import (  # type: ignore[import-untyped]
+    from boxd import (
         APIConnectionError,
+        APIStatusError,
         AuthenticationError,
+        MachineFilesystemError,
         NotFoundError,
         PermissionDeniedError,
         RateLimitError,
@@ -145,6 +148,9 @@ def _classify_boxd_error(
     provider_code = getattr(exc, "code", None)
     if isinstance(provider_code, str):
         context["provider_code"] = provider_code
+    provider_reason = getattr(exc, "reason", None)
+    if isinstance(provider_reason, str):
+        context["provider_reason"] = provider_reason
     if cleanup is not None:
         context["cleanup_status"] = cleanup.status
         if cleanup.provider_resource_id:
@@ -161,6 +167,13 @@ def _classify_boxd_error(
         "context": context,
         "outcome": outcome,
     }
+    # MachinePermissionError is also a PermissionDeniedError, so this goes
+    # before the credentials check.
+    if isinstance(exc, MachineFilesystemError):
+        return SandboxExecutionError(f"boxd {op} failed: {exc}", **common)
+    # Only missing or refused credentials: since boxd 0.2.20, a token exchange
+    # that could not reach boxd is an APIConnectionError, and one that got a
+    # server error an APIStatusError.
     if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
         return SandboxAuthenticationError(
             f"boxd rejected the credentials: {exc}", **common
@@ -179,10 +192,12 @@ def _classify_boxd_error(
         )
     if isinstance(exc, NotFoundError):
         return missing(f"boxd {op} failed: {exc}", **common)
-    # A rate limit or a full machine quota can clear by itself.
-    retryable = isinstance(exc, RateLimitError) and (
-        outcome is ErrorOutcome.FAILED
+    # A rate limit, a full machine quota, or a server error answering the
+    # token exchange can clear by itself.
+    transient = isinstance(exc, RateLimitError) or (
+        isinstance(exc, APIStatusError) and (exc.http_status or 0) >= 500
     )
+    retryable = transient and outcome is ErrorOutcome.FAILED
     if op == "create":
         return SandboxCreationError(
             f"Failed to create boxd machine: {exc}",
@@ -194,17 +209,11 @@ def _classify_boxd_error(
     )
 
 
-def _is_access_error(exc: BaseException) -> bool:
-    """Return whether a files API call failed on access, not on transport.
+def _denied(exc: SandboxError) -> bool:
+    """Return whether *exc* is the ``boxd`` user being refused a path."""
+    from boxd import MachinePermissionError
 
-    boxd reports a path the ``boxd`` user cannot read under a root-only
-    directory as not found, so both cases are retried with sudo.
-    """
-    from boxd import NotFoundError  # type: ignore[import-untyped]
-
-    return isinstance(exc, NotFoundError) or (
-        "permission denied" in str(exc).lower()
-    )
+    return isinstance(exc.__cause__, MachinePermissionError)
 
 
 class BoxdClient:
@@ -221,7 +230,7 @@ class BoxdClient:
 
     def __init__(self) -> None:
         try:
-            from boxd import Boxd  # type: ignore[import-untyped]
+            from boxd import Boxd
         except ImportError as exc:
             raise BackendNotInstalledError(
                 "boxd SDK not installed. Run: pip install bespokelabs-sandbox[boxd]"
@@ -599,9 +608,14 @@ class BoxdSession:
     passwordless sudo, in ``workdir`` when it is set and in ``/home/boxd``
     otherwise.  ``env_vars`` are exported into every command instead of being
     stored on the machine, so they never reach its disk or its snapshots.
-    File paths follow boxd's semantics: relative paths resolve under
-    ``/home/boxd``, and paths the ``boxd`` user cannot write or read are
-    handled through sudo.
+
+    Files go through boxd's file API (``machines.fs``) as the ``boxd`` user:
+    relative paths resolve under ``/home/boxd``, a write creates missing
+    parent directories, keeps an existing file's mode and writes through a
+    symlink, and paths the ``boxd`` user cannot write or read are handled
+    through sudo.  A machine started before boxd had that API, such as one
+    restored from an older snapshot, refuses file operations with a
+    ``SandboxExecutionError`` until it is rebooted.
     """
 
     def __init__(
@@ -646,15 +660,19 @@ class BoxdSession:
                 backend="boxd",
                 op=op,
             )
-        from boxd import ConflictError  # type: ignore[import-untyped]
+        from boxd import ConflictError, MachineFilesystemError
 
         try:
             try:
                 return fn()
             except ConflictError as exc:
-                # Standby and hibernated machines wake on exec by themselves;
-                # a stopped one has to be started first.
-                if "stopped" not in str(exc):
+                # Standby and hibernated machines wake on a call by themselves;
+                # a stopped one has to be started first.  A file that is a
+                # directory, say, is a ConflictError too, but about the path.
+                if isinstance(exc, MachineFilesystemError) or (
+                    self._client.machines.get(self._machine_id).status
+                    != "stopped"
+                ):
                     raise
                 self._client.machines.start(self._machine_id)
                 self._client.machines.wait_until_ready(self._machine_id)
@@ -755,33 +773,26 @@ class BoxdSession:
     # -- Files -------------------------------------------------------------
 
     def list_files(self, path: str = "/") -> list[FileInfo]:
-        from boxd import BoxdError  # type: ignore[import-untyped]
-
         try:
-            listing = self._call(
+            entries = self._call(
                 "list_files",
-                lambda: self._client.machines.files.list_dir(
-                    self._machine_id, path
-                ),
+                lambda: self._client.machines.fs.list(self._machine_id, path),
             )
         except SandboxError as exc:
-            if not isinstance(exc.__cause__, BoxdError) or not (
-                _is_access_error(exc.__cause__)
-            ):
+            if not _denied(exc):
                 raise
             return self._find(path)
-        if listing.truncated:
-            # The listing holds only the first slice of a large directory.
-            return self._find(path)
         base = path.rstrip("/")
+        # An entry is described by what it resolves to: a symlink to a
+        # directory lists as a directory, a dangling one as neither.
         return sorted(
             (
                 FileInfo(
                     path=f"{base}/{entry.name}",
-                    is_dir=entry.is_dir,
-                    size=None if entry.is_dir else entry.size_bytes,
+                    is_dir=entry.target_type == "directory",
+                    size=entry.size if entry.target_type == "file" else None,
                 )
-                for entry in listing.entries
+                for entry in entries
             ),
             key=lambda info: info.path,
         )
@@ -812,78 +823,55 @@ class BoxdSession:
         return sorted(files, key=lambda info: info.path)
 
     def read_file(self, path: str) -> bytes:
-        from boxd import BoxdError  # type: ignore[import-untyped]
-
         try:
             return self._call(
                 "read_file",
-                lambda: self._client.machines.files.download(
-                    self._machine_id, path
-                ),
-                missing=SandboxExecutionError,
+                lambda: self._client.machines.fs.read(self._machine_id, path),
             )
         except SandboxError as exc:
-            cause = exc.__cause__
-            if not isinstance(cause, BoxdError) or not _is_access_error(cause):
+            if not _denied(exc):
                 raise
-            # boxd does not stream an empty file, and the boxd user cannot
-            # read root-only paths; cat through sudo covers both.
-            return self._run_checked(
-                f"sudo -n cat -- {shlex.quote(path)}",
-                op="read_file",
-                buffer=True,
-            ).stdout
+        # The boxd user cannot read the path; root can.
+        return self._run_checked(
+            f"sudo -n cat -- {shlex.quote(path)}", op="read_file", buffer=True
+        ).stdout
 
     def write_file(self, path: str, content: bytes | str) -> None:
-        from boxd import BoxdError  # type: ignore[import-untyped]
-
         data = content if isinstance(content, bytes) else content.encode()
-        if not data:
-            # The boxd upload stream cannot carry an empty file.
-            self._run_checked(self._install_empty(path), op="write_file")
-            return
         try:
             self._call(
                 "write_file",
-                lambda: self._client.machines.files.upload(
+                lambda: self._client.machines.fs.write(
                     self._machine_id, path, data
                 ),
             )
         except SandboxError as exc:
-            cause = exc.__cause__
-            if not isinstance(cause, BoxdError) or not _is_access_error(cause):
+            if not _denied(exc):
                 raise
             self._sudo_write(path, data)
 
-    @staticmethod
-    def _install_empty(path: str) -> str:
-        parent = posixpath.dirname(path) or "."
-        quoted = shlex.quote(path)
-        return (
-            f"{{ mkdir -p -- {shlex.quote(parent)} && : > {quoted}; }} "
-            f"2>/dev/null || {{ sudo -n mkdir -p -- {shlex.quote(parent)} "
-            f"&& sudo -n truncate -s 0 -- {quoted}; }}"
-        )
-
     def _sudo_write(self, path: str, data: bytes) -> None:
-        """Write a path the boxd user cannot: upload to /tmp, then sudo mv."""
+        """Write a path the boxd user cannot: stage it in /tmp, then sudo cp.
+
+        ``cp -T`` writes into an existing file, so it keeps the file's mode
+        and owner and writes through a symlink, as the file API does for the
+        ``boxd`` user's own paths; a new file is root's.
+        """
         staging = f"/tmp/.bespokelabs-sandbox-{uuid.uuid4().hex}"
         self._call(
             "write_file",
-            lambda: self._client.machines.files.upload(
+            lambda: self._client.machines.fs.write(
                 self._machine_id, staging, data
             ),
         )
         parent = posixpath.dirname(path) or "."
-        try:
-            self._run_checked(
-                f"sudo -n mkdir -p -- {shlex.quote(parent)} && "
-                f"sudo -n mv -f -- {shlex.quote(staging)} {shlex.quote(path)}",
-                op="write_file",
-            )
-        except SandboxError:
-            self._exec(f"rm -f -- {shlex.quote(staging)}", op="write_file")
-            raise
+        quoted_staging = shlex.quote(staging)
+        self._run_checked(
+            f"sudo -n mkdir -p -- {shlex.quote(parent)} && "
+            f"sudo -n cp -T -- {quoted_staging} {shlex.quote(path)}; "
+            f"status=$?; rm -f -- {quoted_staging}; exit $status",
+            op="write_file",
+        )
 
     def upload_file(self, local_path: str, remote_path: str) -> None:
         try:
@@ -1017,7 +1005,7 @@ class BoxdSession:
     def destroy(self) -> None:
         if self._machine_id is None:
             return
-        from boxd import NotFoundError  # type: ignore[import-untyped]
+        from boxd import NotFoundError
 
         try:
             self._client.machines.delete(self._machine_id)

@@ -30,7 +30,7 @@ modal = ["modal>=0.60.0"]
 e2b = ["e2b-code-interpreter>=1.0.0"]
 docker = ["docker>=7.0.0"]
 ray = ["ray>=2.0.0"]
-boxd = ["boxd>=0.2.18"]
+boxd = ["boxd>=0.2.20"]
 gcp-batch = ["google-cloud-batch>=0.17.0", "google-cloud-logging>=3.0.0"]
 server = ["fastapi>=0.115.0", "uvicorn>=0.30.0"]
 all = [
@@ -40,7 +40,7 @@ all = [
     "e2b-code-interpreter>=1.0.0",
     "docker>=7.0.0",
     "ray>=2.0.0",
-    "boxd>=0.2.18",
+    "boxd>=0.2.20",
     "google-cloud-batch>=0.17.0",
     "google-cloud-logging>=3.0.0",
 ]

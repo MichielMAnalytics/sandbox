@@ -535,12 +535,13 @@ with Sandbox("boxd", cpu=2, memory_mb=8192) as sb:
 ```
 
 Commands run as the `boxd` user, who has passwordless sudo, in `/home/boxd`.
-`/workspace` is created for that user, and the file helpers fall back to sudo
-for root-owned paths. `env_vars` are exported into each command rather than
-written to the machine, so they stay out of its disk and its snapshots. boxd
-closes a command that prints nothing for 30 minutes, so the adapter writes a
-NUL byte to stderr every five minutes while one runs and strips it from the
-result.
+`/workspace` is created for that user. The file helpers use boxd's file API as
+that user, so a write creates missing parent directories, keeps an existing
+file's mode and writes through a symlink; for root-owned paths they fall back
+to sudo. `env_vars` are exported into each command rather than written to the
+machine, so they stay out of its disk and its snapshots. boxd closes a command
+that prints nothing for 30 minutes, so the adapter writes a NUL byte to stderr
+every five minutes while one runs and strips it from the result.
 
 `timeout_secs` is a command timeout on Local, Safehouse, Docker, Ray, and
 RunPod. E2B and Modal pass it as the provider sandbox timeout; Tensorlake passes
@@ -1164,9 +1165,8 @@ accepted everywhere.
 - boxd: every mode, at creation and through `set_network()`, as an egress
   allow-list. HTTP and HTTPS are admitted by hostname and other traffic by
   address, so a CIDR does not open HTTPS to a bare IP in it. `none` admits
-  nothing, although DNS lookups still resolve; a blocked HTTP request gets a
-  `403`. The policy is enforced before `Sandbox(...)` or `set_network()`
-  returns.
+  nothing: DNS lookups fail and every connection is dropped. The policy is
+  enforced before `Sandbox(...)` or `set_network()` returns.
 
 `allow_internet` keeps its old best-effort behavior (see the matrix) for
 compatibility. Passing both `network` and `allow_internet` is an error; with

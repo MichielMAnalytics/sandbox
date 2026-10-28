@@ -48,7 +48,13 @@ if _HAS_BOXD:
         AuthenticationError,
         Boxd,
         ConflictError,
+        FsEntry,
+        MachineAgentOutdatedError,
+        MachineFileNotFoundError,
+        MachineIsADirectoryError,
+        MachinePermissionError,
         NotFoundError,
+        PermissionDeniedError,
         RateLimitError,
     )
     from boxd.errors import APIStatusError
@@ -58,6 +64,7 @@ if _HAS_BOXD:
         _CREATE_TOKEN_LABEL,
         _DENY_ALL_ENTRY,
         BoxdClient,
+        _classify_boxd_error,
     )
 
 
@@ -71,33 +78,78 @@ def _result(stdout="", stderr="", exit_code=0):
     return SimpleNamespace(stdout=stdout, stderr=stderr, exit_code=exit_code)
 
 
-class _FakeFiles:
+class _FakeFs:
+    """``boxd.machines.fs``, failing with the SDK's own exception classes."""
 
     def __init__(self) -> None:
         self.store: dict[str, bytes] = {}
-        self.uploads: list[str] = []
+        self.writes: list[str] = []
+        # Path prefixes the boxd user may not touch, and paths that are
+        # directories.
         self.denied: set[str] = set()
+        self.dirs: set[str] = set()
         self.listing: list = []
-        self.truncated = False
+        # A machine started before the file API existed refuses every call.
+        self.outdated = False
 
-    def upload(self, machine_id: str, path: str, data: bytes) -> int:
-        self.uploads.append(path)
-        if any(path.startswith(d) for d in self.denied):
-            raise APIStatusError(
-                f"upload failed: mkdir: cannot create directory '{path}': "
-                "Permission denied",
-                code="internal",
+    def _check(self, machine_id: str, path: str) -> None:
+        if self.outdated:
+            raise MachineAgentOutdatedError(
+                f"{machine_id} was started before the filesystem API "
+                "existed; reboot it to update it",
+                code="failed_precondition",
+                reason="agent_outdated",
             )
-        self.store[path] = data
-        return len(data)
+        if any(path.startswith(d) for d in self.denied):
+            raise MachinePermissionError(
+                f"{path}: Permission denied",
+                code="permission_denied",
+                reason="permission_denied",
+                filename=path,
+            )
 
-    def download(self, machine_id: str, path: str) -> bytes:
-        if path not in self.store or not self.store[path]:
-            raise NotFoundError(f"no such file on vm: {path}", code="not_found")
+    def write(self, machine_id: str, path: str, data: bytes):
+        self._check(machine_id, path)
+        self.writes.append(path)
+        self.store[path] = bytes(data)
+        return SimpleNamespace(path=path, size=len(data))
+
+    def read(self, machine_id: str, path: str) -> bytes:
+        self._check(machine_id, path)
+        if path in self.dirs:
+            raise MachineIsADirectoryError(
+                f"{path}: Is a directory",
+                code="failed_precondition",
+                reason="is_a_directory",
+                filename=path,
+            )
+        if path not in self.store:
+            raise MachineFileNotFoundError(
+                f"{path}: No such file or directory",
+                code="not_found",
+                reason="not_found",
+                filename=path,
+            )
         return self.store[path]
 
-    def list_dir(self, machine_id: str, path: str):
-        return SimpleNamespace(entries=self.listing, truncated=self.truncated)
+    def list(self, machine_id: str, path: str) -> list:
+        self._check(machine_id, path)
+        return self.listing
+
+
+def _entry(name: str, kind: str, target: str | None, size: int):
+    """Return a listed entry; ``target`` is what it resolves to."""
+    return FsEntry(
+        name=name,
+        path=f"/workspace/{name}",
+        type=kind,
+        target_type=target,
+        size=size,
+        mode=0o644,
+        mtime_ns=0,
+        uid=1000,
+        gid=1000,
+    )
 
 
 class _FakeProxies:
@@ -126,7 +178,7 @@ class _FakeMachines:
     """Stand-in for ``boxd.machines`` with the surface the backend uses."""
 
     def __init__(self) -> None:
-        self.files = _FakeFiles()
+        self.fs = _FakeFs()
         self.proxies = _FakeProxies()
         self.created: list[dict] = []
         self.deleted: list[str] = []
@@ -188,7 +240,7 @@ class _FakeMachines:
         return SimpleNamespace(
             id=machine_id,
             name=name or "sb-test",
-            status=self.status,
+            status="stopped" if self.stopped else self.status,
             access=SimpleNamespace(domain="boxd.sh"),
         )
 
@@ -486,6 +538,42 @@ class BoxdCreateCleanupTests(unittest.TestCase):
             client.create(SandboxConfig(backend="boxd"))
         self.assertTrue(ctx.exception.retryable)
 
+    def test_transient_credential_failures_are_not_auth_errors(self) -> None:
+        # Since boxd 0.2.20, AuthenticationError means only missing or
+        # refused credentials.
+        unreachable = _classify_boxd_error(
+            APIConnectionError("could not reach the token exchange"),
+            op="create",
+        )
+        self.assertIsInstance(unreachable, SandboxConnectionError)
+        self.assertTrue(unreachable.retryable)
+        server_error = _classify_boxd_error(
+            APIStatusError("exchange failed", http_status=503), op="create"
+        )
+        self.assertIsInstance(server_error, SandboxCreationError)
+        self.assertTrue(server_error.retryable)
+        refused = _classify_boxd_error(
+            AuthenticationError("invalid key", reason="invalid_api_key"),
+            op="create",
+        )
+        self.assertIsInstance(refused, SandboxAuthenticationError)
+        self.assertEqual(refused.context["provider_reason"], "invalid_api_key")
+
+    def test_a_file_permission_error_is_not_an_auth_error(self) -> None:
+        denied = MachinePermissionError(
+            "/etc/x: Permission denied",
+            code="permission_denied",
+            reason="permission_denied",
+            filename="/etc/x",
+        )
+        self.assertIsInstance(
+            _classify_boxd_error(denied, op="read_file"), SandboxExecutionError
+        )
+        self.assertIsInstance(
+            _classify_boxd_error(PermissionDeniedError("no"), op="read_file"),
+            SandboxAuthenticationError,
+        )
+
 
 @unittest.skipUnless(_HAS_BOXD, "boxd SDK not installed")
 class BoxdNetworkTests(unittest.TestCase):
@@ -596,9 +684,9 @@ class BoxdSessionTests(unittest.TestCase):
         )
         self.assertNotIn(
             "s3cr$t",
-            "".join(str(v) for v in self.machines.files.store.values()),
+            "".join(str(v) for v in self.machines.fs.store.values()),
         )
-        self.assertEqual(self.machines.files.uploads, [])
+        self.assertEqual(self.machines.fs.writes, [])
 
     def test_commands_run_in_workdir_and_stop_if_it_is_missing(self) -> None:
         self.session.execute_command("pwd")
@@ -644,55 +732,86 @@ class BoxdSessionTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self.machines.started, ["vm-1"])
 
-    def test_write_and_read_roundtrip(self) -> None:
+    def test_files_go_through_the_file_api(self) -> None:
         self.session.write_file("/tmp/x.bin", b"\x00\x01")
         self.assertEqual(self.session.read_file("/tmp/x.bin"), b"\x00\x01")
+        self.assertEqual(self.machines.fs.writes, ["/tmp/x.bin"])
+        self.assertEqual(self.machines.execs, [])
 
-    def test_empty_files_skip_the_upload_stream(self) -> None:
-        # boxd's upload stream rejects a zero-byte file
-        # ("missing total_size on first chunk").
+    def test_empty_files_are_written_like_any_other(self) -> None:
         self.session.write_file("/workspace/input.txt", "")
-        self.assertEqual(self.machines.files.uploads, [])
-        self.assertIn(": > /workspace/input.txt", self.machines.execs[-1])
+        self.assertEqual(self.session.read_file("/workspace/input.txt"), b"")
+        self.assertEqual(self.machines.execs, [])
 
     def test_root_owned_paths_are_written_through_sudo(self) -> None:
-        self.machines.files.denied.add("/opt")
+        self.machines.fs.denied.add("/opt")
         self.session.write_file("/opt/app/config.json", "{}")
-        staged = self.machines.files.uploads[-1]
+        staged = self.machines.fs.writes[-1]
         self.assertTrue(staged.startswith("/tmp/.bespokelabs-sandbox-"))
+        self.assertEqual(self.machines.fs.store[staged], b"{}")
+        # cp writes into an existing file, keeping its mode and owner.
+        command = self.machines.execs[-1]
+        self.assertIn("sudo -n mkdir -p -- /opt/app && ", command)
         self.assertIn(
-            f"sudo -n mv -f -- {staged} /opt/app/config.json",
-            self.machines.execs[-1],
+            f"sudo -n cp -T -- {staged} /opt/app/config.json;", command
         )
+        self.assertIn(f"rm -f -- {staged}", command)
 
-    def test_unreadable_or_empty_files_are_read_through_sudo(self) -> None:
+    def test_unreadable_files_are_read_through_sudo(self) -> None:
+        self.machines.fs.denied.add("/etc/shadow")
         self.machines.exec_handler = lambda s: _result("root-only")
         self.assertEqual(self.session.read_file("/etc/shadow"), b"root-only")
         self.assertIn("sudo -n cat -- /etc/shadow", self.machines.execs[-1])
 
-    def test_missing_file_is_an_execution_error(self) -> None:
-        self.machines.exec_handler = lambda s: _result(
-            "", "cat: /nope: No such file or directory", 1
-        )
-        with self.assertRaises(SandboxExecutionError):
+    def test_missing_file_is_an_execution_error_without_sudo(self) -> None:
+        with self.assertRaises(SandboxExecutionError) as ctx:
             self.session.read_file("/nope")
+        self.assertIsInstance(ctx.exception.__cause__, FileNotFoundError)
+        self.assertEqual(ctx.exception.context["provider_reason"], "not_found")
+        self.assertEqual(self.machines.execs, [])
+
+    def test_a_path_error_naming_stopped_does_not_start_the_machine(
+        self,
+    ) -> None:
+        # Reading a directory is a ConflictError, as a stopped machine is.
+        self.machines.fs.dirs.add("/srv/stopped")
+        with self.assertRaises(SandboxExecutionError):
+            self.session.read_file("/srv/stopped")
+        self.assertEqual(self.machines.started, [])
+
+    def test_a_machine_older_than_the_file_api_is_told_to_reboot(
+        self,
+    ) -> None:
+        self.machines.fs.outdated = True
+        with self.assertRaises(SandboxExecutionError) as ctx:
+            self.session.write_file("/workspace/x.txt", "x")
+        self.assertIn("reboot it", str(ctx.exception))
+        self.assertEqual(
+            ctx.exception.context["provider_reason"], "agent_outdated"
+        )
+        self.assertEqual(self.machines.started, [])
 
     def test_list_files_returns_full_sorted_paths(self) -> None:
-        self.machines.files.listing = [
-            SimpleNamespace(name="out", is_dir=True, size_bytes=0),
-            SimpleNamespace(name="program.py", is_dir=False, size_bytes=12),
+        self.machines.fs.listing = [
+            _entry("program.py", "file", "file", 12),
+            _entry("out", "directory", "directory", 4096),
+            _entry("data", "symlink", "directory", 4096),
+            _entry("gone", "symlink", None, 4),
         ]
         files = self.session.list_files("/workspace/")
+        # Entries are described by what they resolve to.
         self.assertEqual(
             [(f.path, f.is_dir, f.size) for f in files],
             [
+                ("/workspace/data", True, None),
+                ("/workspace/gone", False, None),
                 ("/workspace/out", True, None),
                 ("/workspace/program.py", False, 12),
             ],
         )
 
-    def test_truncated_listing_falls_back_to_find(self) -> None:
-        self.machines.files.truncated = True
+    def test_an_unreadable_directory_is_listed_with_sudo_find(self) -> None:
+        self.machines.fs.denied.add("/data")
         self.machines.exec_handler = lambda s: _result(
             "f\t3\t/data/a\0d\t4096\t/data/b\0"
         )
@@ -900,6 +1019,27 @@ class BoxdLiveTests(unittest.TestCase):
         sb.write_file("/opt/app/config.json", "{}")
         self.assertEqual(sb.read_file("/opt/app/config.json"), b"{}")
         self.assertTrue(sb.read_file("/etc/shadow"))
+        sb.execute_command("sudo install -m 600 /dev/null /etc/bsp-test")
+        sb.write_file("/etc/bsp-test", "b")
+        self.assertEqual(
+            sb.execute_command("sudo stat -c '%a %U' /etc/bsp-test").stdout,
+            "600 root\n",
+        )
+
+    def test_overwrites_keep_the_mode_and_write_through_symlinks(self) -> None:
+        sb = self._sandbox()
+        sb.write_file("/workspace/run.sh", "#!/bin/sh\necho one\n")
+        sb.execute_command(
+            "chmod 755 /workspace/run.sh && ln -s run.sh /workspace/link"
+        )
+        sb.write_file("/workspace/link", "#!/bin/sh\necho two\n")
+        result = sb.execute_command(
+            "stat -c '%a %F' /workspace/run.sh /workspace/link "
+            "&& /workspace/run.sh"
+        )
+        self.assertEqual(
+            result.stdout, "755 regular file\n777 symbolic link\ntwo\n"
+        )
 
     def test_network_policies_are_enforced(self) -> None:
         sb = self._sandbox(network=NetworkPolicy(mode="none"))
